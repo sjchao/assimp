@@ -122,7 +122,7 @@ Property* ReadTypedProperty(const Element& element)
             ParseTokenAsFloat(*tok[6]))
         );
     }
-    else if (!strcmp(cs,"double") || !strcmp(cs,"Number") || !strcmp(cs,"float") || !strcmp(cs,"Float") || !strcmp(cs,"FieldOfView") || !strcmp( cs, "UnitScaleFactor" ) ) {
+    else if (!strcmp(cs,"double") || !strcmp(cs,"Number") || !strcmp(cs,"float") || !strcmp(cs,"Float") || !strcmp(cs,"FieldOfView") || !strcmp( cs, "UnitScaleFactor" ) || !strcmp(cs, "Visibility") ) {
         checkTokenCount(tok, 5);
         return new TypedProperty<float>(ParseTokenAsFloat(*tok[4]));
     }
@@ -215,6 +215,26 @@ const Property* PropertyTable::Get(const std::string& name) const
     }
 
     return (*it).second;
+}
+
+// ------------------------------------------------------------------------------------------------
+const Property* PropertyTable::GetOwnProperty(const std::string& name) const
+{
+    PropertyMap::const_iterator it = props.find(name);
+    if (it != props.end()) {
+        return (*it).second;
+    }
+
+    // Only check node's own lazy properties, NOT template defaults
+    LazyPropertyMap::const_iterator lit = lazyProps.find(name);
+    if (lit != lazyProps.end()) {
+        props[name] = ReadTypedProperty(*(*lit).second);
+        it = props.find(name);
+        ai_assert(it != props.end());
+        return (*it).second;
+    }
+
+    return nullptr;
 }
 
 DirectPropertyMap PropertyTable::GetUnparsedProperties() const

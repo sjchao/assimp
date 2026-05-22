@@ -406,6 +406,16 @@ int ParseTokenAsInt(const Token& t, const char*& err_out)
     if(t.IsBinary())
     {
         const char* data = t.begin();
+        // 'C' = 1-byte bool (used by some Autodesk/Maya FBX exporters)
+        if (data[0] == 'C') {
+            return static_cast<int>(data[1]);
+        }
+        // 'Y' = 2-byte int16
+        if (data[0] == 'Y') {
+            BE_NCONST int16_t ival = SafeParse<int16_t>(data+1, t.end());
+            AI_SWAP2(ival);
+            return static_cast<int>(ival);
+        }
         if (data[0] != 'I') {
             err_out = "failed to parse I(nt), unexpected data type (binary)";
             return 0;

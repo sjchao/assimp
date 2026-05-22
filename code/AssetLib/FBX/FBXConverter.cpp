@@ -925,10 +925,66 @@ bool FBXConverter::GenerateTransformationNodeChain(const Model &model, const std
 
 void FBXConverter::SetupNodeMetadata(const Model &model, aiNode &nd) {
     const PropertyTable &props = model.Props();
+
+    // Pre-access visibility properties using GetOwnProperty (not template defaults)
+    // so they are parsed and cached in props, then excluded from unparsed properties.
+    const Property* showProp = props.GetOwnProperty("Show");
+    if (!showProp) {
+        showProp = props.GetOwnProperty("Primary Visibility");
+    }
+    const Property* visProp = props.GetOwnProperty("Visibility");
+
+    bool showValue = true;
+    bool hasShowValue = false;
+    if (showProp) {
+        hasShowValue = true;
+        const TypedProperty<bool>* boolProp = showProp->As<TypedProperty<bool>>();
+        if (boolProp) {
+            showValue = boolProp->Value();
+        } else {
+            const TypedProperty<float>* floatProp = showProp->As<TypedProperty<float>>();
+            if (floatProp) {
+                showValue = floatProp->Value() != 0.0f;
+            } else {
+                const TypedProperty<int>* intProp = showProp->As<TypedProperty<int>>();
+                if (intProp) {
+                    showValue = intProp->Value() != 0;
+                }
+            }
+        }
+    }
+
+    float visValue = 1.0f;
+    bool hasVisValue = false;
+    if (visProp) {
+        hasVisValue = true;
+        const TypedProperty<float>* floatProp = visProp->As<TypedProperty<float>>();
+        if (floatProp) {
+            visValue = floatProp->Value();
+        } else {
+            const TypedProperty<bool>* boolProp = visProp->As<TypedProperty<bool>>();
+            if (boolProp) {
+                visValue = boolProp->Value() ? 1.0f : 0.0f;
+            } else {
+                const TypedProperty<int>* intProp = visProp->As<TypedProperty<int>>();
+                if (intProp) {
+                    visValue = static_cast<float>(intProp->Value());
+                }
+            }
+        }
+    }
+
+    // An explicit Show=true is redundant when Visibility is also present and can
+    // incorrectly mask Visibility=0 in downstream consumers. Keep Show only when
+    // it carries information that Visibility alone cannot express.
+    const bool writeShowMetadata = hasShowValue && (!hasVisValue || !showValue);
+    const bool writeVisibilityMetadata = hasVisValue;
+
     DirectPropertyMap unparsedProperties = props.GetUnparsedProperties();
 
-    // create metadata on node
-    const std::size_t numStaticMetaData = 2;
+    // create metadata on node: UserProperties, IsNull, plus visibility entries
+    const std::size_t numStaticMetaData =
+            2 + (writeShowMetadata ? 1 : 0) + (writeVisibilityMetadata ? 1 : 0);
     aiMetadata *data = aiMetadata::Alloc(static_cast<unsigned int>(unparsedProperties.size() + numStaticMetaData));
     nd.mMetaData = data;
     int index = 0;
@@ -937,6 +993,19 @@ void FBXConverter::SetupNodeMetadata(const Model &model, aiNode &nd) {
     data->Set(index++, "UserProperties", aiString(PropertyGet<std::string>(props, "UDP3DSMAX", "")));
     // preserve the info that a node was marked as Null node in the original file.
     data->Set(index++, "IsNull", model.IsNull() ? true : false);
+
+    // Write Show only when the node has its own "Show" / "Primary Visibility"
+    // property and it adds information beyond an explicit Visibility entry.
+    if (writeShowMetadata) {
+        data->Set(index++, "Show", showValue);
+    }
+
+    // Write Visibility (float) only when node has its own "Visibility" property.
+    // This preserves partial transparency values (e.g. 0.5) that would be lost
+    // if coerced to a boolean Show entry.
+    if (writeVisibilityMetadata) {
+        data->Set(index++, "Visibility", visValue);
+    }
 
     // add unparsed properties to the node's metadata
     for (const DirectPropertyMap::value_type &prop : unparsedProperties) {

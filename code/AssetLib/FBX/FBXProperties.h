@@ -107,6 +107,11 @@ public:
 
     const Property* Get(const std::string& name) const;
 
+    // Get a property from the node's own Properties70 only, without falling through to template defaults.
+    // This is important for visibility properties where template defaults (e.g. Show=true)
+    // should not override the node's own Visibility=0.
+    const Property* GetOwnProperty(const std::string& name) const;
+
     // PropertyTable's need not be coupled with FBX elements so this can be nullptr
     const Element* GetElement() const {
         return element;
