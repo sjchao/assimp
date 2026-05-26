@@ -46,13 +46,29 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "Common/assbin_chunks.h"
 #include "PostProcessing/ProcessHelper.h"
 
+#include <assimp/DefaultIOSystem.h>
 #include <assimp/Exceptional.h>
+#include <assimp/material.h>
+#include <assimp/types.h>
 #include <assimp/version.h>
 #include <assimp/IOStream.hpp>
 
 #include "zlib.h"
 
+#include <cerrno>
+#include <cstring>
 #include <ctime>
+#include <map>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #if _MSC_VER
 #pragma warning(push)
@@ -121,6 +137,486 @@ inline size_t Write<double>(IOStream *stream, const double &f) {
 
     return 8;
 }
+
+namespace {
+
+struct TexturePropertySlotKey {
+    unsigned int semantic{ 0 };
+    unsigned int index{ 0 };
+
+    bool operator<(const TexturePropertySlotKey &rhs) const {
+        if (semantic != rhs.semantic) {
+            return semantic < rhs.semantic;
+        }
+        return index < rhs.index;
+    }
+};
+
+struct TexturePropertySlotState {
+    std::set<int> embeddedIndices;
+    std::vector<std::pair<const aiMaterialProperty *, int>> properties;
+};
+
+struct AssbinExternalTexturePlan {
+    bool externalizeTextures{ false };
+    std::vector<std::string> textureReferencesByIndex;
+    std::unordered_map<const aiMaterialProperty *, std::vector<char>> propertyStringOverrides;
+};
+
+static bool StartsWith(const std::string &value, const char *prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+static bool EndsWith(const std::string &value, const char *suffix) {
+    const size_t suffixLength = std::strlen(suffix);
+    return value.length() >= suffixLength &&
+           value.compare(value.length() - suffixLength, suffixLength, suffix) == 0;
+}
+
+static bool IsTexturePropertyKey(const aiString &key) {
+    const std::string keyString(key.C_Str());
+    return keyString == _AI_MATKEY_TEXTURE_BASE || (StartsWith(keyString, "$raw.") && EndsWith(keyString, "|file"));
+}
+
+static unsigned int InferTexturePropertySemantic(const aiMaterialProperty *prop) {
+    ai_assert(prop != nullptr);
+    const std::string key(prop->mKey.C_Str());
+    unsigned int semantic = prop->mSemantic;
+    if (!StartsWith(key, "$raw.") || !EndsWith(key, "|file")) {
+        return semantic;
+    }
+    if (key.find("NormalMap") != std::string::npos) {
+        return aiTextureType_NORMALS;
+    }
+    if (key.find("DiffuseColor") != std::string::npos || key.find("Diffuse") != std::string::npos) {
+        return aiTextureType_DIFFUSE;
+    }
+    if (key.find("SpecularColor") != std::string::npos || key.find("Specular") != std::string::npos) {
+        return aiTextureType_SPECULAR;
+    }
+    if (key.find("Opacity") != std::string::npos || key.find("Alpha") != std::string::npos) {
+        return aiTextureType_OPACITY;
+    }
+    if (key.find("Emissive") != std::string::npos) {
+        return aiTextureType_EMISSIVE;
+    }
+    return semantic;
+}
+
+static bool TryReadMaterialPropertyString(const aiMaterialProperty *prop, aiString &out) {
+    if (nullptr == prop || aiPTI_String != prop->mType || nullptr == prop->mData || prop->mDataLength < 5) {
+        return false;
+    }
+
+    const uint32_t length = *reinterpret_cast<const uint32_t *>(prop->mData);
+    if (length + 5 != prop->mDataLength || length >= AI_MAXLEN) {
+        return false;
+    }
+
+    out.length = length;
+    std::memcpy(out.data, prop->mData + 4, length);
+    out.data[length] = '\0';
+    return true;
+}
+
+static std::vector<char> BuildMaterialStringData(const std::string &value) {
+    aiString stringValue(value);
+    std::vector<char> encoded(stringValue.length + 5, '\0');
+    const uint32_t length = stringValue.length;
+    std::memcpy(encoded.data(), &length, sizeof(length));
+    std::memcpy(encoded.data() + sizeof(length), stringValue.C_Str(), stringValue.length);
+    return encoded;
+}
+
+static std::string GetOutputDirectory(const char *filePath) {
+    ai_assert(filePath != nullptr);
+    std::string path(filePath);
+    const std::string::size_type separator = path.find_last_of("\\/");
+    if (separator == std::string::npos) {
+        return ".";
+    }
+    if (separator == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, separator);
+}
+
+static bool EnsureDirectoryExists(const std::string &directoryPath) {
+    if (directoryPath.empty()) {
+        return false;
+    }
+
+    errno = 0;
+#ifdef _WIN32
+    const int result = ::_mkdir(directoryPath.c_str());
+#else
+    const int result = ::mkdir(directoryPath.c_str(), 0777);
+#endif
+    return result == 0 || errno == EEXIST;
+}
+
+static std::string NormalizeExtension(const std::string &extension) {
+    if (extension.empty()) {
+        return {};
+    }
+    std::string normalized(extension);
+    for (char &ch : normalized) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    if (normalized[0] != '.') {
+        normalized.insert(normalized.begin(), '.');
+    }
+    return normalized;
+}
+
+static std::string GetExtensionFromFilename(const aiString &filename) {
+    if (filename.length == 0) {
+        return {};
+    }
+
+    const std::string shortFilename = DefaultIOSystem::fileName(filename.C_Str());
+    const std::string::size_type dotIndex = shortFilename.find_last_of('.');
+    if (dotIndex == std::string::npos || dotIndex == shortFilename.length() - 1) {
+        return {};
+    }
+    return NormalizeExtension(shortFilename.substr(dotIndex));
+}
+
+static std::string CanonicalizeTextureFileExtension(const std::string &extension) {
+    if (extension == ".jpeg") {
+        return ".jpg";
+    }
+    if (extension == ".tiff") {
+        return ".tif";
+    }
+    return extension;
+}
+
+static bool IsKnownTextureFileExtension(const std::string &extension) {
+    static const std::set<std::string> knownTextureExtensions = {
+        ".basis",
+        ".bmp",
+        ".dds",
+        ".exr",
+        ".gif",
+        ".hdr",
+        ".jpg",
+        ".jpeg",
+        ".ktx",
+        ".ktx2",
+        ".png",
+        ".psd",
+        ".tga",
+        ".tif",
+        ".tiff",
+        ".webp"
+    };
+    return knownTextureExtensions.find(extension) != knownTextureExtensions.end();
+}
+
+static std::string GetExtensionFromFormatHint(const aiTexture *texture) {
+    ai_assert(texture != nullptr);
+    if (texture->mHeight != 0) {
+        return ".tga";
+    }
+
+    std::string hint(texture->achFormatHint);
+    if (hint.empty()) {
+        return {};
+    }
+
+    for (char &ch : hint) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+
+    if (hint == "jpeg") {
+        hint = "jpg";
+    }
+
+    if (hint.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789") != std::string::npos) {
+        return {};
+    }
+
+    return NormalizeExtension(hint);
+}
+
+static bool MatchesMagic(const uint8_t *data, size_t size, const char *magic, size_t magicSize, size_t offset = 0) {
+    return size >= offset + magicSize && 0 == std::memcmp(data + offset, magic, magicSize);
+}
+
+static std::string DetectCompressedTextureExtension(const aiTexture *texture) {
+    ai_assert(texture != nullptr);
+    if (texture->mHeight != 0 || texture->mWidth == 0 || nullptr == texture->pcData) {
+        return {};
+    }
+
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(texture->pcData);
+    const size_t size = texture->mWidth;
+
+    static const unsigned char pngMagic[] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    static const unsigned char jpgMagic[] = { 0xff, 0xd8, 0xff };
+    static const unsigned char gifMagic[] = { 'G', 'I', 'F', '8' };
+    static const unsigned char bmpMagic[] = { 'B', 'M' };
+    static const unsigned char ddsMagic[] = { 'D', 'D', 'S', ' ' };
+    static const unsigned char ktxMagic[] = { 0xab, 'K', 'T', 'X', ' ', '1', '1', 0xbb, 0x0d, 0x0a, 0x1a, 0x0a };
+    static const unsigned char ktx2Magic[] = { 0xab, 'K', 'T', 'X', ' ', '2', '0', 0xbb, 0x0d, 0x0a, 0x1a, 0x0a };
+    static const unsigned char tiffLittleMagic[] = { 'I', 'I', 0x2a, 0x00 };
+    static const unsigned char tiffBigMagic[] = { 'M', 'M', 0x00, 0x2a };
+
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(pngMagic), sizeof(pngMagic))) {
+        return ".png";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(jpgMagic), sizeof(jpgMagic))) {
+        return ".jpg";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(gifMagic), sizeof(gifMagic))) {
+        return ".gif";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(bmpMagic), sizeof(bmpMagic))) {
+        return ".bmp";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(ddsMagic), sizeof(ddsMagic))) {
+        return ".dds";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(ktxMagic), sizeof(ktxMagic)) ||
+            MatchesMagic(bytes, size, reinterpret_cast<const char *>(ktx2Magic), sizeof(ktx2Magic))) {
+        return ".ktx2";
+    }
+    if (MatchesMagic(bytes, size, "RIFF", 4, 0) && MatchesMagic(bytes, size, "WEBP", 4, 8)) {
+        return ".webp";
+    }
+    if (MatchesMagic(bytes, size, reinterpret_cast<const char *>(tiffLittleMagic), sizeof(tiffLittleMagic)) ||
+            MatchesMagic(bytes, size, reinterpret_cast<const char *>(tiffBigMagic), sizeof(tiffBigMagic))) {
+        return ".tif";
+    }
+    return {};
+}
+
+static std::string DetermineTextureFileExtension(const aiTexture *texture) {
+    ai_assert(texture != nullptr);
+    if (texture->mHeight != 0) {
+        return ".tga";
+    }
+
+    const std::string hintExtension = GetExtensionFromFormatHint(texture);
+    const std::string canonicalHintExtension = CanonicalizeTextureFileExtension(hintExtension);
+    if (IsKnownTextureFileExtension(canonicalHintExtension)) {
+        return canonicalHintExtension;
+    }
+
+    const std::string detectedExtension = DetectCompressedTextureExtension(texture);
+    if (!detectedExtension.empty()) {
+        return CanonicalizeTextureFileExtension(detectedExtension);
+    }
+
+    const std::string filenameExtension = CanonicalizeTextureFileExtension(GetExtensionFromFilename(texture->mFilename));
+    if (IsKnownTextureFileExtension(filenameExtension)) {
+        return filenameExtension;
+    }
+
+    return ".bin";
+}
+
+static std::string GetTextureFilenameStem(const aiTexture *texture) {
+    ai_assert(texture != nullptr);
+    if (texture->mFilename.length == 0) {
+        return {};
+    }
+
+    const std::string shortFilename = DefaultIOSystem::fileName(texture->mFilename.C_Str());
+    const std::string::size_type dotIndex = shortFilename.find_last_of('.');
+    if (dotIndex == std::string::npos) {
+        return shortFilename;
+    }
+    return shortFilename.substr(0, dotIndex);
+}
+
+static std::string SanitizeTextureFilenameStem(const std::string &stem) {
+    std::string sanitized;
+    sanitized.reserve(stem.length());
+
+    for (unsigned char ch : stem) {
+        if (ch < 32 || ch == '<' || ch == '>' || ch == ':' || ch == '"' || ch == '/' || ch == '\\' || ch == '|' || ch == '?' || ch == '*') {
+            sanitized.push_back('_');
+            continue;
+        }
+        sanitized.push_back(static_cast<char>(ch));
+    }
+
+    while (!sanitized.empty() && (sanitized.back() == ' ' || sanitized.back() == '.')) {
+        sanitized.back() = '_';
+    }
+
+    if (sanitized == "." || sanitized == "..") {
+        return {};
+    }
+
+    return sanitized;
+}
+
+static std::string BuildTextureFileNameKey(const std::string &filename) {
+    std::string key(filename);
+    for (char &ch : key) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return key;
+}
+
+static std::string BuildTextureFileName(const aiTexture *texture, std::set<std::string> &usedTextureFileNames) {
+    ai_assert(texture != nullptr);
+
+    std::string stem = SanitizeTextureFilenameStem(GetTextureFilenameStem(texture));
+    if (stem.empty()) {
+        stem = "embedded";
+    }
+
+    const std::string extension = DetermineTextureFileExtension(texture);
+    std::string candidate = stem + extension;
+    std::string candidateKey = BuildTextureFileNameKey(candidate);
+    for (unsigned int suffix = 1; usedTextureFileNames.find(candidateKey) != usedTextureFileNames.end(); ++suffix) {
+        candidate = stem + "_" + std::to_string(suffix) + extension;
+        candidateKey = BuildTextureFileNameKey(candidate);
+    }
+
+    usedTextureFileNames.insert(candidateKey);
+    return candidate;
+}
+
+static void WriteTextureAsTga(IOStream *stream, const aiTexture *texture) {
+    ai_assert(stream != nullptr);
+    ai_assert(texture != nullptr);
+    if (texture->mWidth > 0xffff || texture->mHeight > 0xffff) {
+        throw DeadlyExportError("Unable to externalize embedded texture as TGA because dimensions exceed 16-bit limits");
+    }
+
+    unsigned char header[18] = {};
+    header[2] = 2; // uncompressed true-color image
+    header[12] = static_cast<unsigned char>(texture->mWidth & 0xffu);
+    header[13] = static_cast<unsigned char>((texture->mWidth >> 8u) & 0xffu);
+    header[14] = static_cast<unsigned char>(texture->mHeight & 0xffu);
+    header[15] = static_cast<unsigned char>((texture->mHeight >> 8u) & 0xffu);
+    header[16] = 32; // bits per pixel
+    header[17] = 0x28; // 8-bit alpha + top-left origin
+
+    stream->Write(header, sizeof(header), 1);
+    stream->Write(texture->pcData, sizeof(aiTexel), texture->mWidth * texture->mHeight);
+}
+
+static void WriteTextureToExternalFile(IOSystem *ioSystem, const std::string &outputPath, const aiTexture *texture) {
+    ai_assert(ioSystem != nullptr);
+    ai_assert(texture != nullptr);
+
+    std::unique_ptr<IOStream> output(ioSystem->Open(outputPath, "wb"));
+    if (!output) {
+        throw DeadlyExportError("Unable to open external texture file " + outputPath);
+    }
+
+    if (texture->mHeight == 0) {
+        output->Write(texture->pcData, 1, texture->mWidth);
+        return;
+    }
+
+    WriteTextureAsTga(output.get(), texture);
+}
+
+static AssbinExternalTexturePlan BuildExternalTexturePlan(const char *outputFile, IOSystem *ioSystem, const aiScene *scene) {
+    ai_assert(outputFile != nullptr);
+    ai_assert(ioSystem != nullptr);
+    ai_assert(scene != nullptr);
+
+    AssbinExternalTexturePlan plan;
+    if (scene->mNumTextures == 0) {
+        return plan;
+    }
+
+    const char separator = ioSystem->getOsSeparator();
+    const std::string outputDirectory = GetOutputDirectory(outputFile);
+    const std::string textureDirectoryName = "textures";
+    const std::string textureDirectoryPath = outputDirectory + separator + textureDirectoryName;
+
+    if (!EnsureDirectoryExists(textureDirectoryPath)) {
+        throw DeadlyExportError("Unable to create external texture directory " + textureDirectoryPath);
+    }
+
+    plan.externalizeTextures = true;
+    plan.textureReferencesByIndex.resize(scene->mNumTextures);
+    std::set<std::string> usedTextureFileNames;
+
+    for (unsigned int textureIndex = 0; textureIndex < scene->mNumTextures; ++textureIndex) {
+        const aiTexture *texture = scene->mTextures[textureIndex];
+        if (nullptr == texture || nullptr == texture->pcData) {
+            throw DeadlyExportError("Unable to externalize embedded texture because texture data is missing");
+        }
+
+        const std::string outputFileName = BuildTextureFileName(texture, usedTextureFileNames);
+        const std::string outputPath = textureDirectoryPath + separator + outputFileName;
+        WriteTextureToExternalFile(ioSystem, outputPath, texture);
+        plan.textureReferencesByIndex[textureIndex] = textureDirectoryName + "/" + outputFileName;
+    }
+
+    for (unsigned int materialIndex = 0; materialIndex < scene->mNumMaterials; ++materialIndex) {
+        const aiMaterial *material = scene->mMaterials[materialIndex];
+        if (nullptr == material) {
+            continue;
+        }
+
+        std::map<TexturePropertySlotKey, TexturePropertySlotState> slots;
+        for (unsigned int propertyIndex = 0; propertyIndex < material->mNumProperties; ++propertyIndex) {
+            const aiMaterialProperty *property = material->mProperties[propertyIndex];
+            if (nullptr == property || !IsTexturePropertyKey(property->mKey)) {
+                continue;
+            }
+
+            aiString textureReference;
+            if (!TryReadMaterialPropertyString(property, textureReference) || textureReference.length == 0) {
+                continue;
+            }
+
+            const std::pair<const aiTexture *, int> embeddedTexture = scene->GetEmbeddedTextureAndIndex(textureReference.C_Str());
+            const int embeddedIndex = embeddedTexture.first != nullptr ? embeddedTexture.second : -1;
+
+            TexturePropertySlotKey slotKey;
+            slotKey.semantic = InferTexturePropertySemantic(property);
+            slotKey.index = property->mIndex;
+
+            TexturePropertySlotState &slot = slots[slotKey];
+            slot.properties.push_back(std::make_pair(property, embeddedIndex));
+            if (embeddedIndex >= 0) {
+                slot.embeddedIndices.insert(embeddedIndex);
+            }
+        }
+
+        for (const auto &slotEntry : slots) {
+            const TexturePropertySlotState &slot = slotEntry.second;
+            if (slot.embeddedIndices.size() == 1) {
+                const int embeddedIndex = *slot.embeddedIndices.begin();
+                const std::vector<char> encodedPath = BuildMaterialStringData(plan.textureReferencesByIndex[static_cast<size_t>(embeddedIndex)]);
+                for (const auto &propertyEntry : slot.properties) {
+                    plan.propertyStringOverrides[propertyEntry.first] = encodedPath;
+                }
+                continue;
+            }
+
+            for (const auto &propertyEntry : slot.properties) {
+                if (propertyEntry.second < 0) {
+                    continue;
+                }
+                plan.propertyStringOverrides[propertyEntry.first] =
+                        BuildMaterialStringData(plan.textureReferencesByIndex[static_cast<size_t>(propertyEntry.second)]);
+            }
+        }
+    }
+
+    return plan;
+}
+
+} // namespace
 
 // -----------------------------------------------------------------------------------
 // Serialize a vec3
@@ -327,6 +823,7 @@ class AssbinFileWriter {
 private:
     bool shortened;
     bool compressed;
+    AssbinExternalTexturePlan externalTexturePlan;
 
 protected:
     // -----------------------------------------------------------------------------------
@@ -564,6 +1061,15 @@ protected:
         Write<unsigned int>(&chunk, prop->mSemantic);
         Write<unsigned int>(&chunk, prop->mIndex);
 
+        const auto overrideIt = externalTexturePlan.propertyStringOverrides.find(prop);
+        if (overrideIt != externalTexturePlan.propertyStringOverrides.end()) {
+            const std::vector<char> &encodedValue = overrideIt->second;
+            Write<unsigned int>(&chunk, static_cast<unsigned int>(encodedValue.size()));
+            Write<unsigned int>(&chunk, static_cast<unsigned int>(aiPTI_String));
+            chunk.Write(encodedValue.data(), 1, encodedValue.size());
+            return;
+        }
+
         Write<unsigned int>(&chunk, prop->mDataLength);
         Write<unsigned int>(&chunk, (unsigned int)prop->mType);
         chunk.Write(prop->mData, 1, prop->mDataLength);
@@ -681,7 +1187,7 @@ protected:
         Write<unsigned int>(&chunk, scene->mNumMeshes);
         Write<unsigned int>(&chunk, scene->mNumMaterials);
         Write<unsigned int>(&chunk, scene->mNumAnimations);
-        Write<unsigned int>(&chunk, scene->mNumTextures);
+        Write<unsigned int>(&chunk, externalTexturePlan.externalizeTextures ? 0u : scene->mNumTextures);
         Write<unsigned int>(&chunk, scene->mNumLights);
         Write<unsigned int>(&chunk, scene->mNumCameras);
 
@@ -707,9 +1213,11 @@ protected:
         }
 
         // write all textures
-        for (unsigned int i = 0; i < scene->mNumTextures; ++i) {
-            const aiTexture *mesh = scene->mTextures[i];
-            WriteBinaryTexture(&chunk, mesh);
+        if (!externalTexturePlan.externalizeTextures) {
+            for (unsigned int i = 0; i < scene->mNumTextures; ++i) {
+                const aiTexture *mesh = scene->mTextures[i];
+                WriteBinaryTexture(&chunk, mesh);
+            }
         }
 
         // write lights
@@ -733,6 +1241,8 @@ public:
     // -----------------------------------------------------------------------------------
     // Write a binary model dump
     void WriteBinaryDump(const char *pFile, const char *cmd, IOSystem *pIOSystem, const aiScene *pScene) {
+        externalTexturePlan = BuildExternalTexturePlan(pFile, pIOSystem, pScene);
+
         IOStream *out = pIOSystem->Open(pFile, "wb");
         if (!out)
             throw std::runtime_error("Unable to open output file " + std::string(pFile) + '\n');
