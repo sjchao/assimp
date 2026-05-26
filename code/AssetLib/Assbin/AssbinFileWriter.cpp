@@ -55,9 +55,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "zlib.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -163,6 +167,27 @@ struct AssbinExternalTexturePlan {
     std::unordered_map<const aiMaterialProperty *, std::vector<char>> propertyStringOverrides;
 };
 
+struct TextureAssetEntry {
+    std::string absolutePath;
+    std::string relativePath;
+    std::string fileNameLower;
+    mutable uintmax_t fileSize{ 0 };
+    mutable bool hasFileSize{ false };
+    mutable uint32_t contentHash{ 0 };
+    mutable bool hasContentHash{ false };
+};
+
+struct TextureAssetIndex {
+    std::string assetRootDirectory;
+    std::vector<TextureAssetEntry> entries;
+    std::unordered_map<std::string, std::vector<const TextureAssetEntry *>> entriesByFileName;
+};
+
+struct ResolvedExternalTextureReference {
+    std::string absolutePath;
+    std::string referencePath;
+};
+
 static bool StartsWith(const std::string &value, const char *prefix) {
     return value.rfind(prefix, 0) == 0;
 }
@@ -245,14 +270,367 @@ static bool EnsureDirectoryExists(const std::string &directoryPath) {
     if (directoryPath.empty()) {
         return false;
     }
+    std::error_code errorCode;
+    const std::filesystem::path normalizedPath = std::filesystem::u8path(directoryPath);
+    if (std::filesystem::is_directory(normalizedPath, errorCode)) {
+        return true;
+    }
 
-    errno = 0;
-#ifdef _WIN32
-    const int result = ::_mkdir(directoryPath.c_str());
-#else
-    const int result = ::mkdir(directoryPath.c_str(), 0777);
-#endif
-    return result == 0 || errno == EEXIST;
+    errorCode.clear();
+    return std::filesystem::create_directories(normalizedPath, errorCode) || !errorCode;
+}
+
+static std::string ToLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) -> char {
+        if (ch >= 'A' && ch <= 'Z') {
+            return static_cast<char>(ch - 'A' + 'a');
+        }
+        return static_cast<char>(ch);
+    });
+    return value;
+}
+
+static bool IsAbsolutePathString(const std::string &value) {
+    return (value.length() >= 2 && std::isalpha(static_cast<unsigned char>(value[0])) && value[1] == ':') ||
+           StartsWith(value, "\\\\") ||
+           StartsWith(value, "/") ||
+           StartsWith(value, "\\");
+}
+
+static std::string TrimAsciiWhitespace(const std::string &value) {
+    const std::string::size_type start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return {};
+    }
+
+    const std::string::size_type end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+static std::string SanitizeTextureReference(const std::string &value) {
+    std::string trimmed = TrimAsciiWhitespace(value);
+    if (trimmed.empty() || StartsWith(trimmed, "*") || StartsWith(trimmed, "http://") || StartsWith(trimmed, "https://")) {
+        return {};
+    }
+
+    for (std::string::size_type index = 1; index + 1 < trimmed.length(); ++index) {
+        if (std::isalpha(static_cast<unsigned char>(trimmed[index - 1])) && trimmed[index] == ':' &&
+                (trimmed[index + 1] == '\\' || trimmed[index + 1] == '/')) {
+            return trimmed.substr(index - 1);
+        }
+    }
+
+    return trimmed;
+}
+
+static std::string StripLeadingRelativeSegments(const std::string &value) {
+    std::string normalized = value;
+    while (StartsWith(normalized, "../") || StartsWith(normalized, "..\\") || StartsWith(normalized, "./") || StartsWith(normalized, ".\\")) {
+        const std::string::size_type separator = normalized.find_first_of("\\/");
+        if (separator == std::string::npos || separator + 1 >= normalized.length()) {
+            return {};
+        }
+        normalized.erase(0, separator + 1);
+    }
+    return normalized;
+}
+
+static std::string NormalizePathSlashes(std::string value) {
+    std::replace(value.begin(), value.end(), '\\', '/');
+    return value;
+}
+
+static bool IsRegularFilePath(const std::filesystem::path &filePath) {
+    std::error_code errorCode;
+    return std::filesystem::is_regular_file(filePath, errorCode);
+}
+
+static std::string BuildRelativeReferencePath(const std::string &assetRootDirectory, const std::filesystem::path &absolutePath) {
+    if (assetRootDirectory.empty()) {
+        return absolutePath.u8string();
+    }
+
+    const std::filesystem::path normalizedRoot = std::filesystem::u8path(assetRootDirectory).lexically_normal();
+    const std::filesystem::path normalizedPath = absolutePath.lexically_normal();
+    const std::filesystem::path relativePath = normalizedPath.lexically_relative(normalizedRoot);
+    if (!relativePath.empty()) {
+        const std::string normalizedRelative = relativePath.generic_u8string();
+        if (!StartsWith(normalizedRelative, "../") && !StartsWith(normalizedRelative, "..\\")) {
+            return normalizedRelative;
+        }
+    }
+
+    return absolutePath.u8string();
+}
+
+static std::string NormalizeExtension(const std::string &extension);
+static bool IsKnownTextureFileExtension(const std::string &extension);
+
+static void BuildTextureAssetIndex(TextureAssetIndex &index, const std::string &assetRootDirectory) {
+    index.assetRootDirectory = assetRootDirectory;
+    index.entries.clear();
+    index.entriesByFileName.clear();
+    if (assetRootDirectory.empty()) {
+        return;
+    }
+
+    std::error_code errorCode;
+    const std::filesystem::path rootPath = std::filesystem::u8path(assetRootDirectory);
+    if (!std::filesystem::is_directory(rootPath, errorCode)) {
+        return;
+    }
+
+    std::filesystem::recursive_directory_iterator it(rootPath, std::filesystem::directory_options::skip_permission_denied, errorCode);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!errorCode && it != end) {
+        const std::filesystem::directory_entry &entry = *it;
+        if (entry.is_regular_file(errorCode)) {
+            const std::string extension = NormalizeExtension(entry.path().extension().u8string());
+            if (IsKnownTextureFileExtension(extension)) {
+                TextureAssetEntry textureEntry;
+                textureEntry.absolutePath = entry.path().lexically_normal().u8string();
+                textureEntry.relativePath = entry.path().lexically_relative(rootPath).generic_u8string();
+                textureEntry.fileNameLower = ToLowerAscii(entry.path().filename().u8string());
+                index.entries.push_back(textureEntry);
+            }
+        }
+
+        errorCode.clear();
+        it.increment(errorCode);
+    }
+
+    for (const TextureAssetEntry &entry : index.entries) {
+        index.entriesByFileName[entry.fileNameLower].push_back(&entry);
+    }
+}
+
+static uintmax_t GetTextureAssetFileSize(const TextureAssetEntry *entry) {
+    ai_assert(entry != nullptr);
+    if (!entry->hasFileSize) {
+        std::error_code errorCode;
+        entry->fileSize = std::filesystem::file_size(std::filesystem::u8path(entry->absolutePath), errorCode);
+        entry->hasFileSize = !errorCode;
+    }
+    return entry->fileSize;
+}
+
+static uint32_t GetTextureAssetContentHash(const TextureAssetEntry *entry) {
+    ai_assert(entry != nullptr);
+    if (!entry->hasContentHash) {
+        entry->contentHash = 0;
+        std::ifstream stream(std::filesystem::u8path(entry->absolutePath), std::ios::binary);
+        if (stream) {
+            std::vector<char> buffer(64 * 1024);
+            uint32_t hash = 0;
+            while (stream) {
+                stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const std::streamsize bytesRead = stream.gcount();
+                if (bytesRead > 0) {
+                    hash = SuperFastHash(buffer.data(), static_cast<int>(bytesRead), hash);
+                }
+            }
+            entry->contentHash = hash;
+        }
+        entry->hasContentHash = true;
+    }
+    return entry->contentHash;
+}
+
+static const TextureAssetEntry *PickShortestRelativePathEntry(const std::vector<const TextureAssetEntry *> &entries) {
+    if (entries.empty()) {
+        return nullptr;
+    }
+
+    return *std::min_element(entries.begin(), entries.end(), [](const TextureAssetEntry *left, const TextureAssetEntry *right) {
+        ai_assert(left != nullptr);
+        ai_assert(right != nullptr);
+        if (left->relativePath.length() != right->relativePath.length()) {
+            return left->relativePath.length() < right->relativePath.length();
+        }
+        return left->relativePath < right->relativePath;
+    });
+}
+
+static const TextureAssetEntry *PickEquivalentTextureEntry(const std::vector<const TextureAssetEntry *> &entries) {
+    if (entries.empty()) {
+        return nullptr;
+    }
+    if (entries.size() == 1) {
+        return entries[0];
+    }
+
+    const uintmax_t expectedSize = GetTextureAssetFileSize(entries[0]);
+    const uint32_t expectedHash = GetTextureAssetContentHash(entries[0]);
+    for (size_t index = 1; index < entries.size(); ++index) {
+        if (GetTextureAssetFileSize(entries[index]) != expectedSize) {
+            return nullptr;
+        }
+        if (GetTextureAssetContentHash(entries[index]) != expectedHash) {
+            return nullptr;
+        }
+    }
+
+    return PickShortestRelativePathEntry(entries);
+}
+
+static bool TryResolveDirectTextureReference(
+        const std::string &textureReference,
+        const std::string &assetRootDirectory,
+        ResolvedExternalTextureReference &resolvedReference) {
+    std::filesystem::path candidatePath;
+    if (IsAbsolutePathString(textureReference)) {
+        candidatePath = std::filesystem::u8path(textureReference);
+    } else {
+        const std::string strippedReference = StripLeadingRelativeSegments(textureReference);
+        if (strippedReference.empty()) {
+            return false;
+        }
+        candidatePath = std::filesystem::u8path(assetRootDirectory) / std::filesystem::u8path(NormalizePathSlashes(strippedReference));
+    }
+
+    candidatePath = candidatePath.lexically_normal();
+    if (!IsRegularFilePath(candidatePath)) {
+        return false;
+    }
+
+    resolvedReference.absolutePath = candidatePath.u8string();
+    resolvedReference.referencePath = BuildRelativeReferencePath(assetRootDirectory, candidatePath);
+    return true;
+}
+
+static bool TryResolveTextureFileReference(
+        const std::string &textureReference,
+        const std::string &assetRootDirectory,
+        TextureAssetIndex &assetIndex,
+        bool &assetIndexBuilt,
+        ResolvedExternalTextureReference &resolvedReference) {
+    const std::string sanitizedReference = SanitizeTextureReference(textureReference);
+    if (sanitizedReference.empty()) {
+        return false;
+    }
+
+    if (TryResolveDirectTextureReference(sanitizedReference, assetRootDirectory, resolvedReference)) {
+        return true;
+    }
+
+    const std::string fileNameLower = ToLowerAscii(DefaultIOSystem::fileName(sanitizedReference));
+    if (fileNameLower.empty()) {
+        return false;
+    }
+
+    if (!assetIndexBuilt) {
+        BuildTextureAssetIndex(assetIndex, assetRootDirectory);
+        assetIndexBuilt = true;
+    }
+
+    const auto entryIt = assetIndex.entriesByFileName.find(fileNameLower);
+    if (entryIt == assetIndex.entriesByFileName.end()) {
+        return false;
+    }
+
+    const TextureAssetEntry *resolvedEntry = PickEquivalentTextureEntry(entryIt->second);
+    if (nullptr == resolvedEntry) {
+        return false;
+    }
+
+    resolvedReference.absolutePath = resolvedEntry->absolutePath;
+    resolvedReference.referencePath = resolvedEntry->relativePath;
+    return true;
+}
+
+static std::string BuildExternalTextureOutputReferencePath(const std::string &resolvedReferencePath, const std::string &absolutePath) {
+    const std::string normalizedReference = NormalizePathSlashes(resolvedReferencePath);
+    if (normalizedReference.empty() || IsAbsolutePathString(normalizedReference)) {
+        return std::string("textures/") + DefaultIOSystem::fileName(absolutePath);
+    }
+
+    std::vector<std::string> pathSegments;
+    std::string currentSegment;
+    for (char ch : normalizedReference) {
+        if (ch == '/') {
+            if (!currentSegment.empty() && currentSegment != "." && currentSegment != "..") {
+                pathSegments.push_back(currentSegment);
+            }
+            currentSegment.clear();
+            continue;
+        }
+        currentSegment.push_back(ch);
+    }
+    if (!currentSegment.empty() && currentSegment != "." && currentSegment != "..") {
+        pathSegments.push_back(currentSegment);
+    }
+
+    if (pathSegments.empty()) {
+        return std::string("textures/") + DefaultIOSystem::fileName(absolutePath);
+    }
+    if (pathSegments.front() == "textures") {
+        return normalizedReference;
+    }
+
+    std::string outputReference = "textures";
+    for (const std::string &segment : pathSegments) {
+        outputReference += "/";
+        outputReference += segment;
+    }
+    return outputReference;
+}
+
+static bool FilesHaveSameContent(const std::filesystem::path &leftPath, const std::filesystem::path &rightPath) {
+    std::error_code errorCode;
+    if (std::filesystem::file_size(leftPath, errorCode) != std::filesystem::file_size(rightPath, errorCode) || errorCode) {
+        return false;
+    }
+
+    std::ifstream left(leftPath, std::ios::binary);
+    std::ifstream right(rightPath, std::ios::binary);
+    if (!left || !right) {
+        return false;
+    }
+
+    std::vector<char> leftBuffer(64 * 1024);
+    std::vector<char> rightBuffer(64 * 1024);
+    while (left && right) {
+        left.read(leftBuffer.data(), static_cast<std::streamsize>(leftBuffer.size()));
+        right.read(rightBuffer.data(), static_cast<std::streamsize>(rightBuffer.size()));
+        const std::streamsize leftRead = left.gcount();
+        const std::streamsize rightRead = right.gcount();
+        if (leftRead != rightRead) {
+            return false;
+        }
+        if (leftRead <= 0) {
+            break;
+        }
+        if (0 != std::memcmp(leftBuffer.data(), rightBuffer.data(), static_cast<size_t>(leftRead))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string EnsureUniqueExternalTextureOutputPath(const std::string &absoluteSourcePath, const std::string &absoluteOutputPath) {
+    const std::filesystem::path sourcePath = std::filesystem::u8path(absoluteSourcePath).lexically_normal();
+    const std::filesystem::path desiredPath = std::filesystem::u8path(absoluteOutputPath).lexically_normal();
+    if (sourcePath == desiredPath) {
+        return desiredPath.u8string();
+    }
+
+    const std::filesystem::path parentPath = desiredPath.parent_path();
+    const std::string stem = desiredPath.stem().u8string();
+    const std::string extension = desiredPath.extension().u8string();
+
+    for (unsigned int suffix = 0; ; ++suffix) {
+        std::filesystem::path candidatePath = desiredPath;
+        if (suffix > 0) {
+            candidatePath = parentPath / std::filesystem::u8path(stem + "_" + std::to_string(suffix) + extension);
+        }
+
+        if (!IsRegularFilePath(candidatePath)) {
+            return candidatePath.u8string();
+        }
+        if (FilesHaveSameContent(sourcePath, candidatePath)) {
+            return candidatePath.u8string();
+        }
+    }
 }
 
 static std::string NormalizeExtension(const std::string &extension) {
@@ -531,20 +909,22 @@ static AssbinExternalTexturePlan BuildExternalTexturePlan(const char *outputFile
     ai_assert(scene != nullptr);
 
     AssbinExternalTexturePlan plan;
-    if (scene->mNumTextures == 0) {
-        return plan;
-    }
-
     const char separator = ioSystem->getOsSeparator();
     const std::string outputDirectory = GetOutputDirectory(outputFile);
     const std::string textureDirectoryName = "textures";
     const std::string textureDirectoryPath = outputDirectory + separator + textureDirectoryName;
+    bool textureDirectoryReady = false;
+    const auto ensureTextureDirectory = [&]() {
+        if (textureDirectoryReady) {
+            return;
+        }
+        if (!EnsureDirectoryExists(textureDirectoryPath)) {
+            throw DeadlyExportError("Unable to create external texture directory " + textureDirectoryPath);
+        }
+        textureDirectoryReady = true;
+    };
 
-    if (!EnsureDirectoryExists(textureDirectoryPath)) {
-        throw DeadlyExportError("Unable to create external texture directory " + textureDirectoryPath);
-    }
-
-    plan.externalizeTextures = true;
+    plan.externalizeTextures = scene->mNumTextures > 0;
     plan.textureReferencesByIndex.resize(scene->mNumTextures);
     std::set<std::string> usedTextureFileNames;
 
@@ -554,6 +934,7 @@ static AssbinExternalTexturePlan BuildExternalTexturePlan(const char *outputFile
             throw DeadlyExportError("Unable to externalize embedded texture because texture data is missing");
         }
 
+        ensureTextureDirectory();
         const std::string outputFileName = BuildTextureFileName(texture, usedTextureFileNames);
         const std::string outputPath = textureDirectoryPath + separator + outputFileName;
         WriteTextureToExternalFile(ioSystem, outputPath, texture);
@@ -610,6 +991,81 @@ static AssbinExternalTexturePlan BuildExternalTexturePlan(const char *outputFile
                 plan.propertyStringOverrides[propertyEntry.first] =
                         BuildMaterialStringData(plan.textureReferencesByIndex[static_cast<size_t>(propertyEntry.second)]);
             }
+        }
+    }
+
+    std::unordered_map<std::string, std::string> copiedTextureReferencesByAbsolutePath;
+    TextureAssetIndex assetIndex;
+    bool assetIndexBuilt = false;
+    std::error_code currentDirectoryError;
+    const std::string assetRootDirectory = std::filesystem::current_path(currentDirectoryError).u8string();
+
+    for (unsigned int materialIndex = 0; materialIndex < scene->mNumMaterials; ++materialIndex) {
+        const aiMaterial *material = scene->mMaterials[materialIndex];
+        if (nullptr == material) {
+            continue;
+        }
+
+        for (unsigned int propertyIndex = 0; propertyIndex < material->mNumProperties; ++propertyIndex) {
+            const aiMaterialProperty *property = material->mProperties[propertyIndex];
+            if (nullptr == property || !IsTexturePropertyKey(property->mKey) ||
+                    plan.propertyStringOverrides.find(property) != plan.propertyStringOverrides.end()) {
+                continue;
+            }
+
+            aiString textureReference;
+            if (!TryReadMaterialPropertyString(property, textureReference) || textureReference.length == 0) {
+                continue;
+            }
+
+            if (scene->GetEmbeddedTextureAndIndex(textureReference.C_Str()).first != nullptr) {
+                continue;
+            }
+
+            ResolvedExternalTextureReference resolvedReference;
+            if (!TryResolveTextureFileReference(
+                        textureReference.C_Str(),
+                        assetRootDirectory,
+                        assetIndex,
+                        assetIndexBuilt,
+                        resolvedReference)) {
+                continue;
+            }
+
+            const auto cachedReferenceIt = copiedTextureReferencesByAbsolutePath.find(resolvedReference.absolutePath);
+            if (cachedReferenceIt != copiedTextureReferencesByAbsolutePath.end()) {
+                plan.propertyStringOverrides[property] = BuildMaterialStringData(cachedReferenceIt->second);
+                continue;
+            }
+
+            ensureTextureDirectory();
+            const std::string outputReferencePath = BuildExternalTextureOutputReferencePath(
+                    resolvedReference.referencePath,
+                    resolvedReference.absolutePath);
+            const std::filesystem::path desiredOutputPath =
+                    std::filesystem::u8path(outputDirectory) / std::filesystem::u8path(NormalizePathSlashes(outputReferencePath));
+            const std::string uniqueOutputPath = EnsureUniqueExternalTextureOutputPath(
+                    resolvedReference.absolutePath,
+                    desiredOutputPath.u8string());
+            const std::filesystem::path sourcePath = std::filesystem::u8path(resolvedReference.absolutePath).lexically_normal();
+            const std::filesystem::path targetPath = std::filesystem::u8path(uniqueOutputPath).lexically_normal();
+            if (sourcePath != targetPath && !IsRegularFilePath(targetPath)) {
+                const std::filesystem::path targetDirectory = targetPath.parent_path();
+                if (!targetDirectory.empty() && !EnsureDirectoryExists(targetDirectory.u8string())) {
+                    throw DeadlyExportError("Unable to create external texture directory " + targetDirectory.u8string());
+                }
+
+                std::error_code copyError;
+                std::filesystem::copy_file(sourcePath, targetPath, std::filesystem::copy_options::overwrite_existing, copyError);
+                if (copyError) {
+                    throw DeadlyExportError("Unable to copy external texture file " + resolvedReference.absolutePath + " to " + uniqueOutputPath);
+                }
+            }
+
+            const std::string finalReferencePath =
+                    targetPath.lexically_relative(std::filesystem::u8path(outputDirectory)).generic_string();
+            copiedTextureReferencesByAbsolutePath[resolvedReference.absolutePath] = finalReferencePath;
+            plan.propertyStringOverrides[property] = BuildMaterialStringData(finalReferencePath);
         }
     }
 

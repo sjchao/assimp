@@ -49,6 +49,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/Importer.hpp>
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 using namespace Assimp;
 
@@ -68,6 +70,22 @@ public:
     }
 
 protected:
+    class ScopedCurrentPath {
+    public:
+        explicit ScopedCurrentPath(const std::filesystem::path &nextPath) :
+                previousPath(std::filesystem::current_path()) {
+            std::filesystem::current_path(nextPath);
+        }
+
+        ~ScopedCurrentPath() {
+            std::error_code errorCode;
+            std::filesystem::current_path(previousPath, errorCode);
+        }
+
+    private:
+        std::filesystem::path previousPath;
+    };
+
     static aiScene *CreateSceneWithCompressedEmbeddedTexture(
             const char *materialTexturePath,
             const char *embeddedTextureFilename,
@@ -161,6 +179,19 @@ protected:
         return scene;
     }
 
+    static aiScene *CreateSceneWithExternalTextureReferences(
+            const char *diffuseTexturePath,
+            const char *normalTexturePath) {
+        aiScene *scene = CreateBaseScene();
+
+        scene->mMaterials[0] = new aiMaterial();
+        aiString diffusePath(diffuseTexturePath);
+        aiString normalPath(normalTexturePath);
+        scene->mMaterials[0]->AddProperty(&diffusePath, AI_MATKEY_TEXTURE_DIFFUSE(0));
+        scene->mMaterials[0]->AddProperty(&normalPath, AI_MATKEY_TEXTURE_NORMALS(0));
+        return scene;
+    }
+
     static aiScene *CreateBaseScene() {
         aiScene *scene = new aiScene();
 
@@ -204,6 +235,12 @@ protected:
         std::memset(data, 0, texelCount * sizeof(aiTexel));
         std::memcpy(data, bytes, size);
         return data;
+    }
+
+    static void WriteTestTextureFile(const std::filesystem::path &filePath, const char *content) {
+        std::filesystem::create_directories(filePath.parent_path());
+        std::ofstream output(filePath, std::ios::binary);
+        output.write(content, static_cast<std::streamsize>(std::strlen(content)));
     }
 };
 
@@ -318,6 +355,47 @@ TEST_F(utAssbinImportExport, exportAssbinExternalizesUncompressedEmbeddedTexture
     const aiReturn canonicalGetResult = importedScene->mMaterials[0]->Get(AI_MATKEY_TEXTURE_DIFFUSE(0), canonicalPath);
     ASSERT_EQ(aiReturn_SUCCESS, canonicalGetResult);
     EXPECT_STREQ("textures/mask.tga", canonicalPath.C_Str());
+}
+
+TEST_F(utAssbinImportExport, exportAssbinCopiesExternalTextureReferencesIntoTexturesDirectory) {
+    std::unique_ptr<aiScene> scene(CreateSceneWithExternalTextureReferences(
+            "..\\..\\..\\source-textures\\external-diffuse.png",
+            "/missing/external-normal.png"));
+
+    const std::filesystem::path assetRootDir =
+            std::filesystem::path(ASSIMP_TEST_MODELS_DIR).parent_path().parent_path() / ".tmp" / "assbin_external_asset_root";
+    const std::filesystem::path diffuseSourcePath = assetRootDir / "source-textures" / "external-diffuse.png";
+    const std::filesystem::path normalSourcePath = assetRootDir / "variants" / "external-normal.png";
+    WriteTestTextureFile(diffuseSourcePath, "diffuse-texture");
+    WriteTestTextureFile(normalSourcePath, "normal-texture");
+
+    const std::string outputPath = std::string(ASSIMP_TEST_MODELS_DIR) + "/OBJ/assbin_externalized_external_refs_out.assbin";
+    const std::string diffuseTexturePath = std::string(ASSIMP_TEST_MODELS_DIR) + "/OBJ/textures/source-textures/external-diffuse.png";
+    const std::string normalTexturePath = std::string(ASSIMP_TEST_MODELS_DIR) + "/OBJ/textures/variants/external-normal.png";
+
+    std::filesystem::remove(std::filesystem::u8path(diffuseTexturePath));
+    std::filesystem::remove(std::filesystem::u8path(normalTexturePath));
+
+    ScopedCurrentPath scopedCurrentPath(assetRootDir);
+    Exporter exporter;
+    ASSERT_EQ(aiReturn_SUCCESS, exporter.Export(scene.get(), "assbin", outputPath));
+
+    DefaultIOSystem ioSystem;
+    EXPECT_TRUE(ioSystem.Exists(diffuseTexturePath.c_str()));
+    EXPECT_TRUE(ioSystem.Exists(normalTexturePath.c_str()));
+
+    Importer importer;
+    const aiScene *importedScene = importer.ReadFile(outputPath, aiProcess_ValidateDataStructure);
+    ASSERT_NE(nullptr, importedScene);
+    EXPECT_EQ(0u, importedScene->mNumTextures);
+
+    aiString diffusePath;
+    ASSERT_EQ(aiReturn_SUCCESS, importedScene->mMaterials[0]->Get(AI_MATKEY_TEXTURE_DIFFUSE(0), diffusePath));
+    EXPECT_STREQ("textures/source-textures/external-diffuse.png", diffusePath.C_Str());
+
+    aiString normalPath;
+    ASSERT_EQ(aiReturn_SUCCESS, importedScene->mMaterials[0]->Get(AI_MATKEY_TEXTURE_NORMALS(0), normalPath));
+    EXPECT_STREQ("textures/variants/external-normal.png", normalPath.C_Str());
 }
 
 #endif // #ifndef ASSIMP_BUILD_NO_EXPORT
