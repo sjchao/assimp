@@ -1506,6 +1506,14 @@ ELSE()
   endif()
 ENDIF()
 
+# GCC 8 requires explicit std::filesystem linkage on Linux/C++17.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+    AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+    AND CMAKE_CXX_STANDARD GREATER_EQUAL 17
+    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+  target_link_libraries(assimp stdc++fs)
+endif()
+
 if(ASSIMP_ANDROID_JNIIOSYSTEM)
   set(ASSIMP_ANDROID_JNIIOSYSTEM_PATH port/AndroidJNI)
   add_subdirectory(../${ASSIMP_ANDROID_JNIIOSYSTEM_PATH}/ ../${ASSIMP_ANDROID_JNIIOSYSTEM_PATH}/)
