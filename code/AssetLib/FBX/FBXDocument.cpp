@@ -243,8 +243,8 @@ FileGlobalSettings::FileGlobalSettings(const Document &doc, std::shared_ptr<cons
 }
 
 // ------------------------------------------------------------------------------------------------
-Document::Document(Parser& parser, const ImportSettings& settings) :
-     settings(settings), parser(parser) {
+Document::Document(Parser& parser, const ImportSettings& settings, const std::string &embeddedTextureSpillDirectory) :
+     settings(settings), embeddedTextureSpillDirectory(embeddedTextureSpillDirectory), parser(parser) {
 	ASSIMP_LOG_DEBUG("Creating FBX Document");
 
     // Cannot use array default initialization syntax because vc8 fails on it

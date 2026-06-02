@@ -51,15 +51,222 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "FBXImportSettings.h"
 #include "FBXDocumentUtil.h"
 #include "FBXProperties.h"
+#include <assimp/Exceptional.h>
 #include <assimp/ByteSwapper.h>
 #include <assimp/ParsingUtils.h>
 
 #include "FBXUtil.h"
 
+#include <array>
+#include <filesystem>
+#include <fstream>
+
 namespace Assimp {
 namespace FBX {
 
 using namespace Util;
+
+namespace {
+
+static std::string NormalizeTextureExtension(const std::string &fileName) {
+    if (fileName.empty()) {
+        return ".bin";
+    }
+
+    std::string extension = std::filesystem::path(std::filesystem::u8path(fileName)).extension().u8string();
+    if (extension.empty()) {
+        return ".bin";
+    }
+
+    for (char &ch : extension) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+
+    if (extension == ".jpeg") {
+        return ".jpg";
+    }
+    if (extension == ".tiff") {
+        return ".tif";
+    }
+    return extension;
+}
+
+static std::string SanitizeTextureFileStem(const std::string &value) {
+    std::string stem = value;
+    if (!stem.empty()) {
+        stem = std::filesystem::path(std::filesystem::u8path(stem)).stem().u8string();
+    }
+
+    std::string sanitized;
+    sanitized.reserve(stem.length());
+    for (unsigned char ch : stem) {
+        if (ch < 32 || ch == '<' || ch == '>' || ch == ':' || ch == '"' || ch == '/' || ch == '\\' || ch == '|' || ch == '?' || ch == '*') {
+            sanitized.push_back('_');
+        } else {
+            sanitized.push_back(static_cast<char>(ch));
+        }
+    }
+
+    while (!sanitized.empty() && (sanitized.back() == ' ' || sanitized.back() == '.')) {
+        sanitized.back() = '_';
+    }
+
+    if (sanitized.empty() || sanitized == "." || sanitized == "..") {
+        sanitized = "embedded";
+    }
+    return sanitized;
+}
+
+static std::filesystem::path BuildEmbeddedTextureSpillPath(
+        const std::string &spillDirectory,
+        uint64_t id,
+        const std::string &relativeFileName,
+        const std::string &fileName) {
+    const std::string preferredName = relativeFileName.empty() ? fileName : relativeFileName;
+    const std::string stem = SanitizeTextureFileStem(preferredName);
+    const std::string extension = NormalizeTextureExtension(preferredName);
+    const std::string outputFileName = stem + "_" + std::to_string(id) + extension;
+    return std::filesystem::u8path(spillDirectory) / std::filesystem::u8path(outputFileName);
+}
+
+static void EnsureEmbeddedTextureSpillDirectoryExists(const std::filesystem::path &spillDirectory) {
+    std::error_code errorCode;
+    if (std::filesystem::is_directory(spillDirectory, errorCode)) {
+        return;
+    }
+
+    errorCode.clear();
+    if (!std::filesystem::create_directories(spillDirectory, errorCode) && errorCode) {
+        throw DeadlyImportError("Unable to create embedded FBX texture spill directory: " + spillDirectory.u8string());
+    }
+}
+
+static uint64_t DecodeBase64ToBinaryStream(const char *in, size_t inLength, std::ofstream &output) {
+    if (inLength < 2) {
+        return 0;
+    }
+
+    const size_t realLength = inLength - size_t(in[inLength - 1] == '=') - size_t(in[inLength - 2] == '=');
+    std::array<char, 16 * 1024> buffer{};
+    size_t bufferedBytes = 0;
+    uint64_t totalBytes = 0;
+    int value = 0;
+    int valueBits = -8;
+
+    for (size_t index = 0; index < realLength; ++index) {
+        const uint8_t decoded = Util::DecodeBase64(in[index]);
+        if (decoded == 255) {
+            return 0;
+        }
+
+        value = (value << 6) + decoded;
+        valueBits += 6;
+        if (valueBits >= 0) {
+            buffer[bufferedBytes++] = static_cast<char>((value >> valueBits) & 0xFF);
+            valueBits -= 8;
+            value &= 0xFFF;
+
+            if (bufferedBytes == buffer.size()) {
+                output.write(buffer.data(), static_cast<std::streamsize>(bufferedBytes));
+                if (!output) {
+                    throw DeadlyImportError("Unable to spill embedded FBX texture payload to disk");
+                }
+                totalBytes += bufferedBytes;
+                bufferedBytes = 0;
+            }
+        }
+    }
+
+    if (bufferedBytes > 0) {
+        output.write(buffer.data(), static_cast<std::streamsize>(bufferedBytes));
+        if (!output) {
+            throw DeadlyImportError("Unable to spill embedded FBX texture payload to disk");
+        }
+        totalBytes += bufferedBytes;
+    }
+
+    return totalBytes;
+}
+
+static std::string SpillEmbeddedVideoContentToFile(
+        uint64_t id,
+        const std::string &spillDirectory,
+        const std::string &relativeFileName,
+        const std::string &fileName,
+        const Element &contentElement,
+        const Element &element) {
+    const std::filesystem::path outputPath = BuildEmbeddedTextureSpillPath(spillDirectory, id, relativeFileName, fileName);
+    EnsureEmbeddedTextureSpillDirectoryExists(outputPath.parent_path());
+
+    std::error_code removeError;
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw DeadlyImportError("Unable to open embedded FBX texture spill file: " + outputPath.u8string());
+    }
+
+    try {
+        const Token &token = GetRequiredToken(contentElement, 0);
+        const char *data = token.begin();
+
+        if (!token.IsBinary()) {
+            uint64_t writtenBytes = 0;
+            const size_t numTokens = contentElement.Tokens().size();
+            for (size_t tokenIdx = 0; tokenIdx < numTokens; ++tokenIdx) {
+                const Token &dataToken = GetRequiredToken(contentElement, static_cast<unsigned int>(tokenIdx));
+                const size_t tokenLength = static_cast<size_t>(dataToken.end() - dataToken.begin());
+                if (tokenLength < 2 || dataToken.begin()[0] != '"' || dataToken.end()[-1] != '"') {
+                    DOMError("embedded content is not surrounded by quotation marks", &element);
+                }
+
+                const char *base64data = dataToken.begin() + 1;
+                const size_t base64Length = tokenLength - 2;
+                const size_t decodedSize = Util::ComputeDecodedSizeBase64(base64data, base64Length);
+                if (decodedSize == 0) {
+                    DOMError("Corrupted embedded content found", &element);
+                }
+
+                const uint64_t decodedBytes = DecodeBase64ToBinaryStream(base64data, base64Length, output);
+                if (decodedBytes != decodedSize) {
+                    DOMError("Corrupted embedded content found", &element);
+                }
+                writtenBytes += decodedBytes;
+            }
+
+            if (writtenBytes == 0) {
+                DOMError("Corrupted embedded content found", &element);
+            }
+        } else if (static_cast<size_t>(token.end() - data) < 5) {
+            DOMError("binary data array is too short, need five (5) bytes for type signature and element count", &element);
+        } else if (*data != 'R') {
+            DOMWarning("video content is not raw binary data, ignoring", &element);
+            return {};
+        } else {
+            uint32_t len = 0;
+            ::memcpy(&len, data + 1, sizeof(len));
+            AI_SWAP4(len);
+            output.write(data + 5, static_cast<std::streamsize>(len));
+            if (!output) {
+                throw DeadlyImportError("Unable to spill embedded FBX texture payload to disk");
+            }
+        }
+    } catch (...) {
+        output.close();
+        std::filesystem::remove(outputPath, removeError);
+        throw;
+    }
+
+    output.close();
+    if (!output) {
+        std::filesystem::remove(outputPath, removeError);
+        throw DeadlyImportError("Unable to finalize embedded FBX texture spill file: " + outputPath.u8string());
+    }
+
+    return outputPath.lexically_normal().u8string();
+}
+
+} // namespace
 
 // ------------------------------------------------------------------------------------------------
 Material::Material(uint64_t id, const Element& element, const Document& doc, const std::string& name) :
@@ -217,7 +424,7 @@ Texture::Texture(uint64_t id, const Element& element, const Document& doc, const
     }
 
     // resolve video links
-    if(doc.Settings().readTextures) {
+    if(doc.Settings().readTextures || doc.HasEmbeddedTextureSpillDirectory()) {
         const std::vector<const Connection*>& conns = doc.GetConnectionsByDestinationSequenced(ID());
         for(const Connection* con : conns) {
             const Object* const ob = con->SourceObject();
@@ -300,58 +507,73 @@ Video::Video(uint64_t id, const Element &element, const Document &doc, const std
     if(Content && !Content->Tokens().empty()) {
         //this field is omitted when the embedded texture is already loaded, let's ignore if it's not found
         try {
-            const Token& token = GetRequiredToken(*Content, 0);
-            const char* data = token.begin();
-            if (!token.IsBinary()) {
-                if (*data != '"') {
-                    DOMError("embedded content is not surrounded by quotation marks", &element);
-                } else {
-                    size_t targetLength = 0;
-                    auto numTokens = Content->Tokens().size();
-                    // First time compute size (it could be large like 64Gb and it is good to allocate it once)
-                    for (uint32_t tokenIdx = 0; tokenIdx < numTokens; ++tokenIdx) {
-                        const Token& dataToken = GetRequiredToken(*Content, tokenIdx);
-                        size_t tokenLength = dataToken.end() - dataToken.begin() - 2; // ignore double quotes
-                        const char* base64data = dataToken.begin() + 1;
-                        const size_t outLength = Util::ComputeDecodedSizeBase64(base64data, tokenLength);
-                        if (outLength == 0) {
+            if (doc.HasEmbeddedTextureSpillDirectory()) {
+                externalizedContentPath = SpillEmbeddedVideoContentToFile(
+                        ID(),
+                        doc.EmbeddedTextureSpillDirectory(),
+                        relativeFileName,
+                        fileName,
+                        *Content,
+                        element);
+            }
+
+            if (externalizedContentPath.empty()) {
+                const Token& token = GetRequiredToken(*Content, 0);
+                const char* data = token.begin();
+                if (!token.IsBinary()) {
+                    if (*data != '"') {
+                        DOMError("embedded content is not surrounded by quotation marks", &element);
+                    } else {
+                        size_t targetLength = 0;
+                        auto numTokens = Content->Tokens().size();
+                        // First time compute size (it could be large like 64Gb and it is good to allocate it once)
+                        for (uint32_t tokenIdx = 0; tokenIdx < numTokens; ++tokenIdx) {
+                            const Token& dataToken = GetRequiredToken(*Content, tokenIdx);
+                            size_t tokenLength = dataToken.end() - dataToken.begin() - 2; // ignore double quotes
+                            const char* base64data = dataToken.begin() + 1;
+                            const size_t outLength = Util::ComputeDecodedSizeBase64(base64data, tokenLength);
+                            if (outLength == 0) {
+                                DOMError("Corrupted embedded content found", &element);
+                            }
+                            targetLength += outLength;
+                        }
+                        if (targetLength == 0) {
                             DOMError("Corrupted embedded content found", &element);
                         }
-                        targetLength += outLength;
+                        content = new uint8_t[targetLength];
+                        contentLength = static_cast<uint64_t>(targetLength);
+                        size_t dst_offset = 0;
+                        for (uint32_t tokenIdx = 0; tokenIdx < numTokens; ++tokenIdx) {
+                            const Token& dataToken = GetRequiredToken(*Content, tokenIdx);
+                            size_t tokenLength = dataToken.end() - dataToken.begin() - 2; // ignore double quotes
+                            const char* base64data = dataToken.begin() + 1;
+                            dst_offset += Util::DecodeBase64(base64data, tokenLength, content + dst_offset, targetLength - dst_offset);
+                        }
+                        if (targetLength != dst_offset) {
+                            delete[] content;
+                            content = nullptr;
+                            contentLength = 0;
+                            DOMError("Corrupted embedded content found", &element);
+                        }
                     }
-                    if (targetLength == 0) {
-                        DOMError("Corrupted embedded content found", &element);
-                    }
-                    content = new uint8_t[targetLength];
-                    contentLength = static_cast<uint64_t>(targetLength);
-                    size_t dst_offset = 0;
-                    for (uint32_t tokenIdx = 0; tokenIdx < numTokens; ++tokenIdx) {
-                        const Token& dataToken = GetRequiredToken(*Content, tokenIdx);
-                        size_t tokenLength = dataToken.end() - dataToken.begin() - 2; // ignore double quotes
-                        const char* base64data = dataToken.begin() + 1;
-                        dst_offset += Util::DecodeBase64(base64data, tokenLength, content + dst_offset, targetLength - dst_offset);
-                    }
-                    if (targetLength != dst_offset) {
-                        delete[] content;
-                        contentLength = 0;
-                        DOMError("Corrupted embedded content found", &element);
-                    }
+                } else if (static_cast<size_t>(token.end() - data) < 5) {
+                    DOMError("binary data array is too short, need five (5) bytes for type signature and element count", &element);
+                } else if (*data != 'R') {
+                    DOMWarning("video content is not raw binary data, ignoring", &element);
+                } else {
+                    // read number of elements
+                    uint32_t len = 0;
+                    ::memcpy(&len, data + 1, sizeof(len));
+                    AI_SWAP4(len);
+
+                    contentLength = len;
+
+                    content = new uint8_t[len];
+                    ::memcpy(content, data + 5, len);
                 }
-            } else if (static_cast<size_t>(token.end() - data) < 5) {
-                DOMError("binary data array is too short, need five (5) bytes for type signature and element count", &element);
-            } else if (*data != 'R') {
-                DOMWarning("video content is not raw binary data, ignoring", &element);
-            } else {
-                // read number of elements
-                uint32_t len = 0;
-                ::memcpy(&len, data + 1, sizeof(len));
-                AI_SWAP4(len);
-
-                contentLength = len;
-
-                content = new uint8_t[len];
-                ::memcpy(content, data + 5, len);
             }
+        } catch (const DeadlyImportError&) {
+            throw;
         } catch (const runtime_error& runtimeError) {
             //we don't need the content data for contents that has already been loaded
             ASSIMP_LOG_VERBOSE_DEBUG("Caught exception in FBXMaterial (likely because content was already loaded): ",
@@ -363,7 +585,7 @@ Video::Video(uint64_t id, const Element &element, const Document &doc, const std
 }
 
 Video::~Video() {
-    if (contentLength > 0) {
+    if (content != nullptr) {
         delete[] content;
     }
 }

@@ -583,6 +583,19 @@ enum aiComponent
     "IMPORT_FBX_READ_TEXTURES"
 
 // ---------------------------------------------------------------------------
+/** @brief Spill embedded FBX texture payloads to sidecar files during import.
+ *
+ * If enabled, embedded FBX texture payloads are written to
+ * `<source-model-directory>/.tmp/textures` and material references are
+ * updated to point at those files instead of aiScene::mTextures.
+ *
+ * The default value is false.
+ * Property type: bool
+ */
+#define AI_CONFIG_IMPORT_FBX_EMBEDDED_TEXTURES_SPILL \
+    "IMPORT_FBX_EMBEDDED_TEXTURES_SPILL"
+
+// ---------------------------------------------------------------------------
 /** @brief Set whether the fbx importer will read cameras.
  *
  * The default value is true (1)

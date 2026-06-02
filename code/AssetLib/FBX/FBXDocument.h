@@ -640,6 +640,14 @@ public:
         return contentLength;
     }
 
+    bool HasExternalizedContentPath() const {
+        return !externalizedContentPath.empty();
+    }
+
+    const std::string& ExternalizedContentPath() const {
+        return externalizedContentPath;
+    }
+
     uint8_t* RelinquishContent() {
         uint8_t* ptr = content;
         content = nullptr;
@@ -650,6 +658,7 @@ private:
     std::string type;
     std::string relativeFileName;
     std::string fileName;
+    std::string externalizedContentPath;
     std::shared_ptr<const PropertyTable> props;
 
     uint64_t contentLength;
@@ -1082,7 +1091,7 @@ private:
 /** DOM root for a FBX file */
 class Document {
 public:
-    Document(Parser& parser, const ImportSettings& settings);
+    Document(Parser& parser, const ImportSettings& settings, const std::string &embeddedTextureSpillDirectory);
 
     ~Document();
 
@@ -1120,6 +1129,14 @@ public:
 
     const ImportSettings& Settings() const {
         return settings;
+    }
+
+    bool HasEmbeddedTextureSpillDirectory() const {
+        return !embeddedTextureSpillDirectory.empty();
+    }
+
+    const std::string &EmbeddedTextureSpillDirectory() const {
+        return embeddedTextureSpillDirectory;
     }
 
     const ConnectionMap& ConnectionsBySource() const {
@@ -1164,6 +1181,7 @@ private:
 
 private:
     const ImportSettings& settings;
+    std::string embeddedTextureSpillDirectory;
 
     ObjectMap objects;
     Parser& parser;

@@ -56,6 +56,7 @@ struct ImportSettings {
             readAllMaterials(false),
             readMaterials(true),
             readTextures(true),
+            spillEmbeddedTextures(false),
             readCameras(true),
             readLights(true),
             readAnimations(true),
@@ -98,6 +99,9 @@ struct ImportSettings {
 
     /** import embedded textures? Default value is true.*/
     bool readTextures;
+
+    /** spill embedded FBX texture payloads to sidecar files? Default value is false. */
+    bool spillEmbeddedTextures;
 
     /** import cameras? Default value is true.*/
     bool readCameras;

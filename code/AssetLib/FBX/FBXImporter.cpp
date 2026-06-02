@@ -58,11 +58,22 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/importerdesc.h>
 #include <assimp/Importer.hpp>
 
+#include <filesystem>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace Assimp {
 
 template <>
 const char *LogFunctions<FBXImporter>::Prefix() {
-	return "FBX: ";
+    return "FBX: ";
 }
 
 } // namespace Assimp
@@ -72,32 +83,154 @@ using namespace Assimp::Formatter;
 using namespace Assimp::FBX;
 
 namespace {
-    static constexpr aiImporterDesc desc = {
-	    "Autodesk FBX Importer",
-	    "",
-	    "",
-	    "",
-	    aiImporterFlags_SupportTextFlavour,
-	    0,
-	    0,
-	    0,
-	    0,
-	    "fbx"
-    };
+static constexpr char BinaryFbxMagic[] = "Kaydara FBX Binary";
+
+static std::string BuildDefaultEmbeddedTextureSpillDirectory(const std::string &filePath) {
+    std::error_code errorCode;
+    std::filesystem::path absolutePath = std::filesystem::absolute(std::filesystem::u8path(filePath), errorCode);
+    if (errorCode) {
+        absolutePath = std::filesystem::u8path(filePath);
+    }
+
+    std::filesystem::path parentPath = absolutePath.parent_path();
+    if (parentPath.empty()) {
+        parentPath = std::filesystem::current_path(errorCode);
+        if (errorCode) {
+            parentPath.clear();
+        }
+    }
+
+    return (parentPath / ".tmp" / "textures").lexically_normal().u8string();
 }
+
+class MappedFileBuffer {
+public:
+    MappedFileBuffer() = default;
+
+    ~MappedFileBuffer() {
+        Close();
+    }
+
+    bool Open(const std::string &path, size_t size) {
+        if (0 == size) {
+            return false;
+        }
+
+        Close();
+
+#ifdef _WIN32
+        const std::filesystem::path fsPath = std::filesystem::u8path(path);
+        fileHandle = ::CreateFileW(fsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (INVALID_HANDLE_VALUE == fileHandle) {
+            fileHandle = nullptr;
+            return false;
+        }
+
+        mappingHandle = ::CreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (nullptr == mappingHandle) {
+            Close();
+            return false;
+        }
+
+        mappedData = ::MapViewOfFile(mappingHandle, FILE_MAP_READ, 0, 0, 0);
+        if (nullptr == mappedData) {
+            Close();
+            return false;
+        }
+#else
+        fileDescriptor = ::open(std::filesystem::u8path(path).c_str(), O_RDONLY);
+        if (-1 == fileDescriptor) {
+            return false;
+        }
+
+        mappedData = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fileDescriptor, 0);
+        if (MAP_FAILED == mappedData) {
+            mappedData = nullptr;
+            Close();
+            return false;
+        }
+#endif
+
+        mappedSize = size;
+        return true;
+    }
+
+    void Close() {
+#ifdef _WIN32
+        if (mappedData) {
+            ::UnmapViewOfFile(mappedData);
+            mappedData = nullptr;
+        }
+        if (mappingHandle) {
+            ::CloseHandle(mappingHandle);
+            mappingHandle = nullptr;
+        }
+        if (fileHandle) {
+            ::CloseHandle(fileHandle);
+            fileHandle = nullptr;
+        }
+#else
+        if (mappedData) {
+            ::munmap(mappedData, mappedSize);
+            mappedData = nullptr;
+        }
+        if (-1 != fileDescriptor) {
+            ::close(fileDescriptor);
+            fileDescriptor = -1;
+        }
+#endif
+        mappedSize = 0;
+    }
+
+    const char *Data() const {
+        return static_cast<const char *>(mappedData);
+    }
+
+    size_t Size() const {
+        return mappedSize;
+    }
+
+    bool IsOpen() const {
+        return nullptr != mappedData;
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE fileHandle{ nullptr };
+    HANDLE mappingHandle{ nullptr };
+#else
+    int fileDescriptor{ -1 };
+#endif
+    void *mappedData{ nullptr };
+    size_t mappedSize{ 0 };
+};
+
+static constexpr aiImporterDesc desc = {
+    "Autodesk FBX Importer",
+    "",
+    "",
+    "",
+    aiImporterFlags_SupportTextFlavour,
+    0,
+    0,
+    0,
+    0,
+    "fbx"
+};
+} // namespace
 
 // ------------------------------------------------------------------------------------------------
 // Returns whether the class can handle the format of the given file.
 bool FBXImporter::CanRead(const std::string & pFile, IOSystem * pIOHandler, bool /*checkSig*/) const {
-	// at least ASCII-FBX files usually have a 'FBX' somewhere in their head
-	static const char *tokens[] = { " \n\r\n ", "fbx" };
-	return SearchFileHeaderForToken(pIOHandler, pFile, tokens, AI_COUNT_OF(tokens));
+    // at least ASCII-FBX files usually have a 'FBX' somewhere in their head
+    static const char *tokens[] = { " \n\r\n ", "fbx" };
+    return SearchFileHeaderForToken(pIOHandler, pFile, tokens, AI_COUNT_OF(tokens));
 }
 
 // ------------------------------------------------------------------------------------------------
 // List all extensions handled by this loader
 const aiImporterDesc *FBXImporter::GetInfo() const {
-	return &desc;
+    return &desc;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -115,6 +248,7 @@ void FBXImporter::SetupProperties(const Importer *pImp) {
     mSettings.preservePivots = pImp->GetPropertyBool(AI_CONFIG_IMPORT_FBX_PRESERVE_PIVOTS, true);
     mSettings.optimizeEmptyAnimationCurves = pImp->GetPropertyBool(AI_CONFIG_IMPORT_FBX_OPTIMIZE_EMPTY_ANIMATION_CURVES, true);
     mSettings.useLegacyEmbeddedTextureNaming = pImp->GetPropertyBool(AI_CONFIG_IMPORT_FBX_EMBEDDED_TEXTURES_LEGACY_NAMING, false);
+    mSettings.spillEmbeddedTextures = pImp->GetPropertyBool(AI_CONFIG_IMPORT_FBX_EMBEDDED_TEXTURES_SPILL, false);
     mSettings.removeEmptyBones = pImp->GetPropertyBool(AI_CONFIG_IMPORT_REMOVE_EMPTY_BONES, true);
     mSettings.convertToMeters = pImp->GetPropertyBool(AI_CONFIG_FBX_CONVERT_TO_M, false);
     mSettings.ignoreUpDirection = pImp->GetPropertyBool(AI_CONFIG_IMPORT_FBX_IGNORE_UP_DIRECTION, false);
@@ -124,68 +258,87 @@ void FBXImporter::SetupProperties(const Importer *pImp) {
 // ------------------------------------------------------------------------------------------------
 // Imports the given file into the given scene structure.
 void FBXImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSystem *pIOHandler) {
-	auto streamCloser = [&](IOStream *pStream) {
-		pIOHandler->Close(pStream);
-	};
-	std::unique_ptr<IOStream, decltype(streamCloser)> stream(pIOHandler->Open(pFile, "rb"), streamCloser);
-	if (!stream) {
-		ThrowException("Could not open file for reading");
-	}
+    auto streamCloser = [&](IOStream *pStream) {
+        pIOHandler->Close(pStream);
+    };
+    std::unique_ptr<IOStream, decltype(streamCloser)> stream(pIOHandler->Open(pFile, "rb"), streamCloser);
+    if (!stream) {
+        ThrowException("Could not open file for reading");
+    }
 
     ASSIMP_LOG_DEBUG("Reading FBX file");
+    const std::string embeddedTextureSpillDirectory = mSettings.spillEmbeddedTextures ?
+            BuildDefaultEmbeddedTextureSpillDirectory(pFile) :
+            std::string();
 
-	// read entire file into memory - no streaming for this, fbx
-	// files can grow large, but the assimp output data structure
-	// then becomes very large, too. Assimp doesn't support
-	// streaming for its output data structures so the net win with
-	// streaming input data would be very low.
-	std::vector<char> contents;
-	contents.resize(stream->FileSize() + 1);
-	stream->Read(&*contents.begin(), 1, contents.size() - 1);
-	contents[contents.size() - 1] = 0;
-	const char *const begin = &*contents.begin();
+    const size_t fileSize = stream->FileSize();
+    char header[sizeof(BinaryFbxMagic)] = {};
+    const size_t headerLength = fileSize < (sizeof(BinaryFbxMagic) - 1) ? fileSize : (sizeof(BinaryFbxMagic) - 1);
+    stream->Read(header, 1, headerLength);
+    stream->Seek(0, aiOrigin_SET);
 
-	// broad-phase tokenized pass in which we identify the core
-	// syntax elements of FBX (brackets, commas, key:value mappings)
-	TokenList tokens;
+    const bool is_binary = headerLength == sizeof(BinaryFbxMagic) - 1 &&
+                           !std::strncmp(header, BinaryFbxMagic, sizeof(BinaryFbxMagic) - 1);
+
+    MappedFileBuffer mappedContents;
+    std::vector<char> contents;
+    const char *begin = nullptr;
+    size_t bufferLength = fileSize;
+
+    if (is_binary && mappedContents.Open(pFile, fileSize)) {
+        begin = mappedContents.Data();
+        bufferLength = mappedContents.Size();
+    } else {
+        // ASCII FBX tokenization expects a trailing NUL byte, so keep a copied
+        // buffer for textual files or when memory mapping is unavailable.
+        contents.resize(fileSize + 1);
+        stream->Read(contents.data(), 1, fileSize);
+        contents[fileSize] = 0;
+        begin = contents.data();
+        bufferLength = fileSize;
+    }
+
+    // broad-phase tokenized pass in which we identify the core
+    // syntax elements of FBX (brackets, commas, key:value mappings)
+    TokenList tokens;
     Assimp::StackAllocator tempAllocator;
     try {
-		bool is_binary = false;
-		if (!strncmp(begin, "Kaydara FBX Binary", 18)) {
-			is_binary = true;
-            TokenizeBinary(tokens, begin, contents.size(), tempAllocator);
-		} else {
+        if (is_binary) {
+            TokenizeBinary(tokens, begin, bufferLength, tempAllocator);
+        } else {
             Tokenize(tokens, begin, tempAllocator);
-		}
-
-		// use this information to construct a very rudimentary
-		// parse-tree representing the FBX scope structure
-        Parser parser(tokens, tempAllocator, is_binary);
-
-		// take the raw parse-tree and convert it to a FBX DOM
-		Document doc(parser, mSettings);
-
-		// convert the FBX DOM to aiScene
-		ConvertToAssimpScene(pScene, doc, mSettings.removeEmptyBones);
-
-		// size relative to cm
-		float size_relative_to_cm = doc.GlobalSettings().UnitScaleFactor();
-        if (size_relative_to_cm == 0.0) {
-			// BaseImporter later asserts that fileScale is non-zero.
-			ThrowException("The UnitScaleFactor must be non-zero");
         }
 
-		// Set FBX file scale is relative to CM must be converted to M for
-		// assimp universal format (M)
-		SetFileScale(size_relative_to_cm * 0.01f);
+        // use this information to construct a very rudimentary
+        // parse-tree representing the FBX scope structure
+        Parser parser(tokens, tempAllocator, is_binary);
 
-		// This collection does not own the memory for the tokens, but we need to call their d'tor
+        // take the raw parse-tree and convert it to a FBX DOM
+        Document doc(parser, mSettings, embeddedTextureSpillDirectory);
+
+        // convert the FBX DOM to aiScene
+        ConvertToAssimpScene(pScene, doc, mSettings.removeEmptyBones);
+
+        // size relative to cm
+        float size_relative_to_cm = doc.GlobalSettings().UnitScaleFactor();
+        if (size_relative_to_cm == 0.0) {
+            // BaseImporter later asserts that fileScale is non-zero.
+            ThrowException("The UnitScaleFactor must be non-zero");
+        }
+
+        // Set FBX file scale is relative to CM must be converted to M for
+        // assimp universal format (M)
+        SetFileScale(size_relative_to_cm * 0.01f);
+
+        // This collection does not own the memory for the tokens, but we need to call their d'tor
         std::for_each(tokens.begin(), tokens.end(), Util::destructor_fun<Token>());
+        tempAllocator.FreeAll();
 
     } catch (std::exception &) {
         std::for_each(tokens.begin(), tokens.end(), Util::destructor_fun<Token>());
+        tempAllocator.FreeAll();
         throw;
-	}
+    }
 }
 
 #endif // !ASSIMP_BUILD_NO_FBX_IMPORTER

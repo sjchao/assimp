@@ -1911,6 +1911,11 @@ aiString FBXConverter::GetTexturePath(const Texture *tex) {
 
     const Video *media = tex->Media();
     if (media != nullptr) {
+        if (media->HasExternalizedContentPath()) {
+            path.Set(media->ExternalizedContentPath().c_str());
+            return path;
+        }
+
         bool textureReady = false; //tells if our texture is ready (if it was loaded or if it was found)
         unsigned int index=0;
 
@@ -3859,7 +3864,9 @@ void FBXConverter::ConvertOrphanedEmbeddedTextures() {
                 const size_t length = static_cast<size_t>(key.end() - key.begin());
                 if (strncmp(obtype, "Texture", length) == 0) {
                     if (const Texture *texture = static_cast<const Texture *>(object->Get())) {
-                        if (texture->Media() && texture->Media()->ContentLength() > 0) {
+                        if (texture->Media() &&
+                                texture->Media()->ContentLength() > 0 &&
+                                !texture->Media()->HasExternalizedContentPath()) {
                             realTexture = texture;
                         }
                     }
