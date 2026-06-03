@@ -909,6 +909,10 @@ static AssbinExternalTexturePlan BuildExternalTexturePlan(const char *outputFile
     ai_assert(scene != nullptr);
 
     AssbinExternalTexturePlan plan;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return plan;
+#endif
+
     const char separator = ioSystem->getOsSeparator();
     const std::string outputDirectory = GetOutputDirectory(outputFile);
     const std::string textureDirectoryName = "textures";

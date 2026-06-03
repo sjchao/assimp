@@ -64,7 +64,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -85,7 +87,16 @@ using namespace Assimp::FBX;
 namespace {
 static constexpr char BinaryFbxMagic[] = "Kaydara FBX Binary";
 
+static bool SupportsMappedBinaryFbx() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return false;
+#else
+    return true;
+#endif
+}
+
 static std::string BuildDefaultEmbeddedTextureSpillDirectory(const std::string &filePath) {
+#ifdef _WIN32
     std::error_code errorCode;
     std::filesystem::path absolutePath = std::filesystem::absolute(std::filesystem::u8path(filePath), errorCode);
     if (errorCode) {
@@ -101,6 +112,40 @@ static std::string BuildDefaultEmbeddedTextureSpillDirectory(const std::string &
     }
 
     return (parentPath / ".tmp" / "textures").lexically_normal().u8string();
+#else
+    std::string absolutePath = filePath;
+    if (absolutePath.empty() || absolutePath.front() != '/') {
+        char cwdBuffer[PATH_MAX] = {};
+        if (::getcwd(cwdBuffer, sizeof(cwdBuffer)) != nullptr) {
+            absolutePath.assign(cwdBuffer);
+            if (!absolutePath.empty() && absolutePath.back() != '/') {
+                absolutePath.push_back('/');
+            }
+            absolutePath += filePath;
+        }
+    }
+
+    const size_t lastSeparator = absolutePath.find_last_of('/');
+    std::string parentPath;
+    if (lastSeparator == std::string::npos) {
+        char cwdBuffer[PATH_MAX] = {};
+        if (::getcwd(cwdBuffer, sizeof(cwdBuffer)) != nullptr) {
+            parentPath.assign(cwdBuffer);
+        }
+    } else if (lastSeparator == 0) {
+        parentPath = "/";
+    } else {
+        parentPath = absolutePath.substr(0, lastSeparator);
+    }
+
+    if (parentPath.empty()) {
+        return ".tmp/textures";
+    }
+    if (parentPath.back() == '/') {
+        return parentPath + ".tmp/textures";
+    }
+    return parentPath + "/.tmp/textures";
+#endif
 }
 
 class MappedFileBuffer {
@@ -285,7 +330,7 @@ void FBXImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSy
     const char *begin = nullptr;
     size_t bufferLength = fileSize;
 
-    if (is_binary && mappedContents.Open(pFile, fileSize)) {
+    if (is_binary && SupportsMappedBinaryFbx() && mappedContents.Open(pFile, fileSize)) {
         begin = mappedContents.Data();
         bufferLength = mappedContents.Size();
     } else {
@@ -332,11 +377,9 @@ void FBXImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSy
 
         // This collection does not own the memory for the tokens, but we need to call their d'tor
         std::for_each(tokens.begin(), tokens.end(), Util::destructor_fun<Token>());
-        tempAllocator.FreeAll();
 
     } catch (std::exception &) {
         std::for_each(tokens.begin(), tokens.end(), Util::destructor_fun<Token>());
-        tempAllocator.FreeAll();
         throw;
     }
 }

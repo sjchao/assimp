@@ -61,6 +61,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <filesystem>
 #include <fstream>
 
+#ifndef _WIN32
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
 namespace Assimp {
 namespace FBX {
 
@@ -68,12 +74,52 @@ using namespace Util;
 
 namespace {
 
+static std::string ExtractFileName(const std::string &path) {
+    const size_t lastSeparator = path.find_last_of("/\\");
+    if (lastSeparator == std::string::npos) {
+        return path;
+    }
+    return path.substr(lastSeparator + 1);
+}
+
+static std::string ExtractFileStem(const std::string &path) {
+    std::string fileName = ExtractFileName(path);
+    const size_t lastDot = fileName.find_last_of('.');
+    if (lastDot == std::string::npos || lastDot == 0) {
+        return fileName;
+    }
+    return fileName.substr(0, lastDot);
+}
+
+static std::string ParentDirectory(const std::string &path) {
+    const size_t lastSeparator = path.find_last_of("/\\");
+    if (lastSeparator == std::string::npos) {
+        return {};
+    }
+    if (lastSeparator == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, lastSeparator);
+}
+
+static std::string JoinPath(const std::string &left, const std::string &right) {
+    if (left.empty()) {
+        return right;
+    }
+    if (left.back() == '/' || left.back() == '\\') {
+        return left + right;
+    }
+    return left + "/" + right;
+}
+
 static std::string NormalizeTextureExtension(const std::string &fileName) {
     if (fileName.empty()) {
         return ".bin";
     }
 
-    std::string extension = std::filesystem::path(std::filesystem::u8path(fileName)).extension().u8string();
+    const std::string baseName = ExtractFileName(fileName);
+    const size_t lastDot = baseName.find_last_of('.');
+    std::string extension = lastDot == std::string::npos ? std::string() : baseName.substr(lastDot);
     if (extension.empty()) {
         return ".bin";
     }
@@ -94,10 +140,7 @@ static std::string NormalizeTextureExtension(const std::string &fileName) {
 }
 
 static std::string SanitizeTextureFileStem(const std::string &value) {
-    std::string stem = value;
-    if (!stem.empty()) {
-        stem = std::filesystem::path(std::filesystem::u8path(stem)).stem().u8string();
-    }
+    std::string stem = value.empty() ? std::string() : ExtractFileStem(value);
 
     std::string sanitized;
     sanitized.reserve(stem.length());
@@ -119,7 +162,7 @@ static std::string SanitizeTextureFileStem(const std::string &value) {
     return sanitized;
 }
 
-static std::filesystem::path BuildEmbeddedTextureSpillPath(
+static std::string BuildEmbeddedTextureSpillPath(
         const std::string &spillDirectory,
         uint64_t id,
         const std::string &relativeFileName,
@@ -128,19 +171,50 @@ static std::filesystem::path BuildEmbeddedTextureSpillPath(
     const std::string stem = SanitizeTextureFileStem(preferredName);
     const std::string extension = NormalizeTextureExtension(preferredName);
     const std::string outputFileName = stem + "_" + std::to_string(id) + extension;
-    return std::filesystem::u8path(spillDirectory) / std::filesystem::u8path(outputFileName);
+    return JoinPath(spillDirectory, outputFileName);
 }
 
-static void EnsureEmbeddedTextureSpillDirectoryExists(const std::filesystem::path &spillDirectory) {
+static void EnsureEmbeddedTextureSpillDirectoryExists(const std::string &spillDirectory) {
+#ifdef _WIN32
+    const std::filesystem::path fsSpillDirectory = std::filesystem::u8path(spillDirectory);
     std::error_code errorCode;
-    if (std::filesystem::is_directory(spillDirectory, errorCode)) {
+    if (std::filesystem::is_directory(fsSpillDirectory, errorCode)) {
         return;
     }
 
     errorCode.clear();
-    if (!std::filesystem::create_directories(spillDirectory, errorCode) && errorCode) {
-        throw DeadlyImportError("Unable to create embedded FBX texture spill directory: " + spillDirectory.u8string());
+    if (!std::filesystem::create_directories(fsSpillDirectory, errorCode) && errorCode) {
+        throw DeadlyImportError("Unable to create embedded FBX texture spill directory: " + spillDirectory);
     }
+#else
+    if (spillDirectory.empty() || spillDirectory == "/") {
+        return;
+    }
+
+    std::string partial;
+    if (spillDirectory.front() == '/') {
+        partial = "/";
+    }
+
+    size_t segmentStart = spillDirectory.front() == '/' ? 1 : 0;
+    while (segmentStart <= spillDirectory.size()) {
+        const size_t separator = spillDirectory.find('/', segmentStart);
+        const std::string segment = spillDirectory.substr(
+                segmentStart,
+                separator == std::string::npos ? std::string::npos : separator - segmentStart);
+        if (!segment.empty()) {
+            partial = JoinPath(partial, segment);
+            if (::mkdir(partial.c_str(), 0777) != 0 && errno != EEXIST) {
+                throw DeadlyImportError("Unable to create embedded FBX texture spill directory: " + spillDirectory);
+            }
+        }
+
+        if (separator == std::string::npos) {
+            break;
+        }
+        segmentStart = separator + 1;
+    }
+#endif
 }
 
 static uint64_t DecodeBase64ToBinaryStream(const char *in, size_t inLength, std::ofstream &output) {
@@ -190,6 +264,60 @@ static uint64_t DecodeBase64ToBinaryStream(const char *in, size_t inLength, std:
     return totalBytes;
 }
 
+static void WriteBinaryBufferToStream(const uint8_t *data, uint64_t dataLength, std::ofstream &output) {
+    ai_assert(data != nullptr || dataLength == 0);
+
+    constexpr uint64_t kChunkSize = 16ull * 1024ull * 1024ull;
+    uint64_t writtenBytes = 0;
+    while (writtenBytes < dataLength) {
+        const uint64_t remainingBytes = dataLength - writtenBytes;
+        const uint64_t chunkBytes = remainingBytes < kChunkSize ? remainingBytes : kChunkSize;
+        output.write(
+                reinterpret_cast<const char *>(data + writtenBytes),
+                static_cast<std::streamsize>(chunkBytes));
+        if (!output) {
+            throw DeadlyImportError("Unable to spill embedded FBX texture payload to disk");
+        }
+        writtenBytes += chunkBytes;
+    }
+}
+
+static std::string SpillEmbeddedVideoBufferToFile(
+        uint64_t id,
+        const std::string &spillDirectory,
+        const std::string &relativeFileName,
+        const std::string &fileName,
+        const uint8_t *content,
+        uint64_t contentLength) {
+    const std::string outputPath = BuildEmbeddedTextureSpillPath(spillDirectory, id, relativeFileName, fileName);
+    EnsureEmbeddedTextureSpillDirectoryExists(ParentDirectory(outputPath));
+
+#ifdef _WIN32
+    std::ofstream output(std::filesystem::u8path(outputPath), std::ios::binary | std::ios::trunc);
+#else
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+#endif
+    if (!output) {
+        throw DeadlyImportError("Unable to open embedded FBX texture spill file: " + outputPath);
+    }
+
+    try {
+        WriteBinaryBufferToStream(content, contentLength, output);
+    } catch (...) {
+        output.close();
+        std::remove(outputPath.c_str());
+        throw;
+    }
+
+    output.close();
+    if (!output) {
+        std::remove(outputPath.c_str());
+        throw DeadlyImportError("Unable to finalize embedded FBX texture spill file: " + outputPath);
+    }
+
+    return outputPath;
+}
+
 static std::string SpillEmbeddedVideoContentToFile(
         uint64_t id,
         const std::string &spillDirectory,
@@ -197,13 +325,16 @@ static std::string SpillEmbeddedVideoContentToFile(
         const std::string &fileName,
         const Element &contentElement,
         const Element &element) {
-    const std::filesystem::path outputPath = BuildEmbeddedTextureSpillPath(spillDirectory, id, relativeFileName, fileName);
-    EnsureEmbeddedTextureSpillDirectoryExists(outputPath.parent_path());
+    const std::string outputPath = BuildEmbeddedTextureSpillPath(spillDirectory, id, relativeFileName, fileName);
+    EnsureEmbeddedTextureSpillDirectoryExists(ParentDirectory(outputPath));
 
-    std::error_code removeError;
+#ifdef _WIN32
+    std::ofstream output(std::filesystem::u8path(outputPath), std::ios::binary | std::ios::trunc);
+#else
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+#endif
     if (!output) {
-        throw DeadlyImportError("Unable to open embedded FBX texture spill file: " + outputPath.u8string());
+        throw DeadlyImportError("Unable to open embedded FBX texture spill file: " + outputPath);
     }
 
     try {
@@ -253,17 +384,17 @@ static std::string SpillEmbeddedVideoContentToFile(
         }
     } catch (...) {
         output.close();
-        std::filesystem::remove(outputPath, removeError);
+        std::remove(outputPath.c_str());
         throw;
     }
 
     output.close();
     if (!output) {
-        std::filesystem::remove(outputPath, removeError);
-        throw DeadlyImportError("Unable to finalize embedded FBX texture spill file: " + outputPath.u8string());
+        std::remove(outputPath.c_str());
+        throw DeadlyImportError("Unable to finalize embedded FBX texture spill file: " + outputPath);
     }
 
-    return outputPath.lexically_normal().u8string();
+    return outputPath;
 }
 
 } // namespace
@@ -508,13 +639,21 @@ Video::Video(uint64_t id, const Element &element, const Document &doc, const std
         //this field is omitted when the embedded texture is already loaded, let's ignore if it's not found
         try {
             if (doc.HasEmbeddedTextureSpillDirectory()) {
-                externalizedContentPath = SpillEmbeddedVideoContentToFile(
-                        ID(),
-                        doc.EmbeddedTextureSpillDirectory(),
-                        relativeFileName,
-                        fileName,
-                        *Content,
-                        element);
+                try {
+                    externalizedContentPath = SpillEmbeddedVideoContentToFile(
+                            ID(),
+                            doc.EmbeddedTextureSpillDirectory(),
+                            relativeFileName,
+                            fileName,
+                            *Content,
+                            element);
+                } catch (const DeadlyImportError&) {
+                    throw;
+                } catch (const runtime_error& runtimeError) {
+                    ASSIMP_LOG_VERBOSE_DEBUG(
+                            "Streaming embedded FBX texture spill failed, falling back to buffered decode: ",
+                            runtimeError.what());
+                }
             }
 
             if (externalizedContentPath.empty()) {
@@ -570,6 +709,27 @@ Video::Video(uint64_t id, const Element &element, const Document &doc, const std
 
                     content = new uint8_t[len];
                     ::memcpy(content, data + 5, len);
+                }
+
+                if (doc.HasEmbeddedTextureSpillDirectory() && content != nullptr && contentLength > 0) {
+                    try {
+                        externalizedContentPath = SpillEmbeddedVideoBufferToFile(
+                                ID(),
+                                doc.EmbeddedTextureSpillDirectory(),
+                                relativeFileName,
+                                fileName,
+                                content,
+                                contentLength);
+                        delete[] content;
+                        content = nullptr;
+                        contentLength = 0;
+                    } catch (const DeadlyImportError&) {
+                        throw;
+                    } catch (const runtime_error& runtimeError) {
+                        ASSIMP_LOG_VERBOSE_DEBUG(
+                                "Buffered embedded FBX texture spill failed, keeping texture payload in memory: ",
+                                runtimeError.what());
+                    }
                 }
             }
         } catch (const DeadlyImportError&) {
