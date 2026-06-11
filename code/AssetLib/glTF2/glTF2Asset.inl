@@ -230,6 +230,24 @@ inline bool GetAttribTargetVector(Mesh::Primitive &p, const int targetIndex, con
     return true;
 }
 
+inline Ref<Accessor> ReadGpuInstanceAccessor(Node &node, Asset &r, Value &attributes, const char *memberId, AttribType::Value expectedType) {
+    Value *member = node.FindUInt(attributes, memberId);
+    if (member == nullptr) {
+        return Ref<Accessor>();
+    }
+
+    Ref<Accessor> accessor = r.accessors.Retrieve(member->GetUint());
+    if (!accessor) {
+        throw DeadlyImportError("GLTF: Missing accessor for ", memberId, " in ", getContextForErrorMessages(node.id, node.name));
+    }
+
+    if (accessor->componentType != ComponentType_FLOAT || accessor->type != expectedType) {
+        throw DeadlyImportError("GLTF: Invalid accessor type for ", memberId, " in ", getContextForErrorMessages(node.id, node.name));
+    }
+
+    return accessor;
+}
+
 } // namespace
 
 inline Value *Object::FindString(Value &val, const char *memberId) {
@@ -1803,6 +1821,44 @@ inline void Node::Read(Value &obj, Asset &r) {
                 }
             }
         }
+
+        if (r.extensionsUsed.EXT_mesh_gpu_instancing) {
+            if (Value *ext = FindObject(*curExtensions, "EXT_mesh_gpu_instancing")) {
+                Value *attributes = FindObject(*ext, "attributes");
+                if (attributes == nullptr) {
+                    throw DeadlyImportError("GLTF: Missing attributes for EXT_mesh_gpu_instancing in ", getContextForErrorMessages(id, name));
+                }
+
+                gpuInstance.translation = ReadGpuInstanceAccessor(*this, r, *attributes, "TRANSLATION", AttribType::VEC3);
+                gpuInstance.rotation = ReadGpuInstanceAccessor(*this, r, *attributes, "ROTATION", AttribType::VEC4);
+                gpuInstance.scale = ReadGpuInstanceAccessor(*this, r, *attributes, "SCALE", AttribType::VEC3);
+
+                if (!gpuInstance.translation && !gpuInstance.rotation && !gpuInstance.scale) {
+                    throw DeadlyImportError("GLTF: EXT_mesh_gpu_instancing requires at least one of TRANSLATION, ROTATION, or SCALE in ", getContextForErrorMessages(id, name));
+                }
+
+                Ref<Accessor> instanceAccessors[] = { gpuInstance.translation, gpuInstance.rotation, gpuInstance.scale };
+                for (Ref<Accessor> &accessor : instanceAccessors) {
+                    if (!accessor) {
+                        continue;
+                    }
+
+                    if (gpuInstance.count == 0) {
+                        gpuInstance.count = accessor->count;
+                    } else if (gpuInstance.count != accessor->count) {
+                        throw DeadlyImportError("GLTF: EXT_mesh_gpu_instancing accessors have mismatched counts in ", getContextForErrorMessages(id, name));
+                    }
+                }
+
+                gpuInstance.enabled = gpuInstance.count > 0;
+                if (!gpuInstance.enabled) {
+                    throw DeadlyImportError("GLTF: EXT_mesh_gpu_instancing has no instances in ", getContextForErrorMessages(id, name));
+                }
+                if (meshes.empty()) {
+                    throw DeadlyImportError("GLTF: EXT_mesh_gpu_instancing requires the node to reference a mesh in ", getContextForErrorMessages(id, name));
+                }
+            }
+        }
     }
 }
 
@@ -2173,6 +2229,7 @@ inline void Asset::ReadExtensionsRequired(Document &doc) {
     CHECK_REQUIRED_EXT(KHR_draco_mesh_compression);
     CHECK_REQUIRED_EXT(KHR_texture_basisu);
     CHECK_REQUIRED_EXT(EXT_texture_webp);
+    CHECK_REQUIRED_EXT(EXT_mesh_gpu_instancing);
 
 #undef CHECK_REQUIRED_EXT
 }
@@ -2204,6 +2261,7 @@ inline void Asset::ReadExtensionsUsed(Document &doc) {
     CHECK_EXT(KHR_draco_mesh_compression);
     CHECK_EXT(KHR_texture_basisu);
     CHECK_EXT(EXT_texture_webp);
+    CHECK_EXT(EXT_mesh_gpu_instancing);
 
 #undef CHECK_EXT
 }

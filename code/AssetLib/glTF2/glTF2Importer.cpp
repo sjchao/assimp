@@ -1031,6 +1031,18 @@ static void GetNodeTransform(aiMatrix4x4 &matrix, const glTF2::Node &node) {
     }
 }
 
+static void GetInstanceTransform(aiMatrix4x4 &matrix, const aiVector3D &translation, const aiQuaternion &rotation, const aiVector3D &scale) {
+    aiMatrix4x4 translationMatrix;
+    aiMatrix4x4::Translation(translation, translationMatrix);
+
+    aiMatrix4x4 rotationMatrix(rotation.GetMatrix());
+
+    aiMatrix4x4 scaleMatrix;
+    aiMatrix4x4::Scaling(scale, scaleMatrix);
+
+    matrix = translationMatrix * rotationMatrix * scaleMatrix;
+}
+
 static void BuildVertexWeightMapping(Mesh::Primitive &primitive, std::vector<std::vector<aiVertexWeight>> &map, std::vector<unsigned int>* vertexRemappingTablePtr) {
 
     Mesh::Primitive::Attributes &attr = primitive.attributes;
@@ -1107,6 +1119,115 @@ static std::string GetNodeName(const Node &node) {
     return node.name.empty() ? node.id : node.name;
 }
 
+static void ReadGpuInstanceTransforms(Node::GpuInstanceData &gpuInstance, std::vector<aiVector3D> &translations, std::vector<aiQuaternion> &rotations, std::vector<aiVector3D> &scales) {
+    translations.assign(gpuInstance.count, aiVector3D(0.0f, 0.0f, 0.0f));
+    rotations.assign(gpuInstance.count, aiQuaternion(1.0f, 0.0f, 0.0f, 0.0f));
+    scales.assign(gpuInstance.count, aiVector3D(1.0f, 1.0f, 1.0f));
+
+    if (gpuInstance.translation) {
+        vec3 *values = nullptr;
+        gpuInstance.translation->ExtractData(values, nullptr);
+        for (size_t i = 0; i < gpuInstance.count; ++i) {
+            CopyValue(values[i], translations[i]);
+        }
+        delete[] values;
+    }
+
+    if (gpuInstance.rotation) {
+        vec4 *values = nullptr;
+        gpuInstance.rotation->ExtractData(values, nullptr);
+        for (size_t i = 0; i < gpuInstance.count; ++i) {
+            CopyValue(values[i], rotations[i]);
+        }
+        delete[] values;
+    }
+
+    if (gpuInstance.scale) {
+        vec3 *values = nullptr;
+        gpuInstance.scale->ExtractData(values, nullptr);
+        for (size_t i = 0; i < gpuInstance.count; ++i) {
+            CopyValue(values[i], scales[i]);
+        }
+        delete[] values;
+    }
+}
+
+static void AttachNodeMeshes(aiNode &ainode, aiScene &scene, const std::vector<unsigned int> &meshOffsets, std::vector<std::vector<unsigned int>> &vertexRemappingTables, Node &node) {
+    if (node.meshes.empty()) {
+        return;
+    }
+
+    if (node.meshes.size() > 1) {
+        throw DeadlyImportError("GLTF: Invalid input, found ", node.meshes.size(),
+                " meshes in ", getContextForErrorMessages(node.id, node.name),
+                ", but only 1 mesh per node allowed.");
+    }
+
+    int mesh_idx = node.meshes[0].GetIndex();
+    int count = meshOffsets[mesh_idx + 1] - meshOffsets[mesh_idx];
+
+    ainode.mNumMeshes = count;
+    ainode.mMeshes = new unsigned int[count];
+
+    if (node.skin) {
+        for (int primitiveNo = 0; primitiveNo < count; ++primitiveNo) {
+            unsigned int aiMeshIdx = meshOffsets[mesh_idx] + primitiveNo;
+            aiMesh *mesh = scene.mMeshes[aiMeshIdx];
+            if (mesh->mBones != nullptr) {
+                continue;
+            }
+            unsigned int numBones = static_cast<unsigned int>(node.skin->jointNames.size());
+            std::vector<unsigned int> *vertexRemappingTablePtr = vertexRemappingTables[aiMeshIdx].empty() ? nullptr : &vertexRemappingTables[aiMeshIdx];
+
+            std::vector<std::vector<aiVertexWeight>> weighting(numBones);
+            BuildVertexWeightMapping(node.meshes[0]->primitives[primitiveNo], weighting, vertexRemappingTablePtr);
+
+            mesh->mNumBones = static_cast<unsigned int>(numBones);
+            mesh->mBones = new aiBone *[mesh->mNumBones];
+            std::fill(mesh->mBones, mesh->mBones + mesh->mNumBones, nullptr);
+
+            mat4 *pbindMatrices = nullptr;
+            node.skin->inverseBindMatrices->ExtractData(pbindMatrices, nullptr);
+
+            for (uint32_t i = 0; i < numBones; ++i) {
+                const std::vector<aiVertexWeight> &weights = weighting[i];
+                aiBone *bone = new aiBone();
+
+                Ref<Node> joint = node.skin->jointNames[i];
+                if (!joint->name.empty()) {
+                    bone->mName = joint->name;
+                } else {
+                    static const std::string kDefaultName = "bone_";
+                    char postfix[10] = { 0 };
+                    ASSIMP_itoa10(postfix, i);
+                    bone->mName = (kDefaultName + postfix);
+                }
+                GetNodeTransform(bone->mOffsetMatrix, *joint);
+                CopyValue(pbindMatrices[i], bone->mOffsetMatrix);
+                bone->mNumWeights = static_cast<uint32_t>(weights.size());
+
+                if (bone->mNumWeights > 0) {
+                    bone->mWeights = new aiVertexWeight[bone->mNumWeights];
+                    memcpy(bone->mWeights, weights.data(), bone->mNumWeights * sizeof(aiVertexWeight));
+                } else {
+                    bone->mWeights = new aiVertexWeight[1];
+                    bone->mNumWeights = 1;
+                    bone->mWeights->mVertexId = 0;
+                    bone->mWeights->mWeight = 0.f;
+                }
+                mesh->mBones[i] = bone;
+            }
+
+            delete[] pbindMatrices;
+        }
+    }
+
+    int k = 0;
+    for (unsigned int j = meshOffsets[mesh_idx]; j < meshOffsets[mesh_idx + 1]; ++j, ++k) {
+        ainode.mMeshes[k] = j;
+    }
+}
+
 void ParseExtensions(aiMetadata *metadata, const CustomExtension &extension) {
     if (extension.mStringValue.isPresent) {
         metadata->Add(extension.name, aiString(extension.mStringValue.value));
@@ -1139,15 +1260,39 @@ aiNode *glTF2Importer::ImportNode(glTF2::Asset &r, glTF2::Ref<glTF2::Node> &ptr)
     aiNode *ainode = new aiNode(GetNodeName(node));
 
     try {
-        if (!node.children.empty()) {
-            ainode->mNumChildren = unsigned(node.children.size());
+        const unsigned int instanceChildCount = node.gpuInstance.enabled ? static_cast<unsigned int>(node.gpuInstance.count) : 0;
+        const unsigned int importedChildCount = static_cast<unsigned int>(node.children.size());
+        const unsigned int totalChildCount = instanceChildCount + importedChildCount;
+
+        if (node.gpuInstance.enabled) {
+            mScene->mFlags |= AI_SCENE_FLAGS_ALLOW_SHARED;
+        }
+
+        if (totalChildCount > 0) {
+            ainode->mNumChildren = totalChildCount;
             ainode->mChildren = new aiNode *[ainode->mNumChildren];
             std::fill(ainode->mChildren, ainode->mChildren + ainode->mNumChildren, nullptr);
 
-            for (unsigned int i = 0; i < ainode->mNumChildren; ++i) {
+            unsigned int nextChildIndex = 0;
+            if (node.gpuInstance.enabled) {
+                std::vector<aiVector3D> translations;
+                std::vector<aiQuaternion> rotations;
+                std::vector<aiVector3D> scales;
+                ReadGpuInstanceTransforms(node.gpuInstance, translations, rotations, scales);
+
+                for (unsigned int i = 0; i < instanceChildCount; ++i) {
+                    aiNode *instanceNode = new aiNode(GetNodeName(node) + "_instance_" + ai_to_string(i));
+                    instanceNode->mParent = ainode;
+                    GetInstanceTransform(instanceNode->mTransformation, translations[i], rotations[i], scales[i]);
+                    AttachNodeMeshes(*instanceNode, *mScene, meshOffsets, mVertexRemappingTables, node);
+                    ainode->mChildren[nextChildIndex++] = instanceNode;
+                }
+            }
+
+            for (unsigned int i = 0; i < importedChildCount; ++i) {
                 aiNode *child = ImportNode(r, node.children[i]);
                 child->mParent = ainode;
-                ainode->mChildren[i] = child;
+                ainode->mChildren[nextChildIndex++] = child;
             }
         }
 
@@ -1163,87 +1308,8 @@ aiNode *glTF2Importer::ImportNode(glTF2::Asset &r, glTF2::Ref<glTF2::Node> &ptr)
 
         GetNodeTransform(ainode->mTransformation, node);
 
-        if (!node.meshes.empty()) {
-            // GLTF files contain at most 1 mesh per node.
-            if (node.meshes.size() > 1) {
-                throw DeadlyImportError("GLTF: Invalid input, found ", node.meshes.size(),
-                        " meshes in ", getContextForErrorMessages(node.id, node.name),
-                        ", but only 1 mesh per node allowed.");
-            }
-            int mesh_idx = node.meshes[0].GetIndex();
-            int count = meshOffsets[mesh_idx + 1] - meshOffsets[mesh_idx];
-
-            ainode->mNumMeshes = count;
-            ainode->mMeshes = new unsigned int[count];
-
-            if (node.skin) {
-                for (int primitiveNo = 0; primitiveNo < count; ++primitiveNo) {
-                    unsigned int aiMeshIdx = meshOffsets[mesh_idx] + primitiveNo;
-                    aiMesh *mesh = mScene->mMeshes[aiMeshIdx];
-                    unsigned int numBones = static_cast<unsigned int>(node.skin->jointNames.size());
-                    std::vector<unsigned int> *vertexRemappingTablePtr = mVertexRemappingTables[aiMeshIdx].empty() ? nullptr : &mVertexRemappingTables[aiMeshIdx];
-
-                    std::vector<std::vector<aiVertexWeight>> weighting(numBones);
-                    BuildVertexWeightMapping(node.meshes[0]->primitives[primitiveNo], weighting, vertexRemappingTablePtr);
-
-                    mesh->mNumBones = static_cast<unsigned int>(numBones);
-                    mesh->mBones = new aiBone *[mesh->mNumBones];
-                    std::fill(mesh->mBones, mesh->mBones + mesh->mNumBones, nullptr);
-
-                    // GLTF and Assimp choose to store bone weights differently.
-                    // GLTF has each vertex specify which bones influence the vertex.
-                    // Assimp has each bone specify which vertices it has influence over.
-                    // To convert this data, we first read over the vertex data and pull
-                    // out the bone-to-vertex mapping.  Then, when creating the aiBones,
-                    // we copy the bone-to-vertex mapping into the bone.  This is unfortunate
-                    // both because it's somewhat slow and because, for many applications,
-                    // we then need to reconvert the data back into the vertex-to-bone
-                    // mapping which makes things doubly-slow.
-
-                    mat4 *pbindMatrices = nullptr;
-                    node.skin->inverseBindMatrices->ExtractData(pbindMatrices, nullptr);
-
-                    for (uint32_t i = 0; i < numBones; ++i) {
-                        const std::vector<aiVertexWeight> &weights = weighting[i];
-                        aiBone *bone = new aiBone();
-
-                        Ref<Node> joint = node.skin->jointNames[i];
-                        if (!joint->name.empty()) {
-                            bone->mName = joint->name;
-                        } else {
-                            // Assimp expects each bone to have a unique name.
-                            static const std::string kDefaultName = "bone_";
-                            char postfix[10] = { 0 };
-                            ASSIMP_itoa10(postfix, i);
-                            bone->mName = (kDefaultName + postfix);
-                        }
-                        GetNodeTransform(bone->mOffsetMatrix, *joint);
-                        CopyValue(pbindMatrices[i], bone->mOffsetMatrix);
-                        bone->mNumWeights = static_cast<uint32_t>(weights.size());
-
-                        if (bone->mNumWeights > 0) {
-                            bone->mWeights = new aiVertexWeight[bone->mNumWeights];
-                            memcpy(bone->mWeights, weights.data(), bone->mNumWeights * sizeof(aiVertexWeight));
-                        } else {
-                            // Assimp expects all bones to have at least 1 weight.
-                            bone->mWeights = new aiVertexWeight[1];
-                            bone->mNumWeights = 1;
-                            bone->mWeights->mVertexId = 0;
-                            bone->mWeights->mWeight = 0.f;
-                        }
-                        mesh->mBones[i] = bone;
-                    }
-
-                    if (pbindMatrices) {
-                        delete[] pbindMatrices;
-                    }
-                }
-            }
-
-            int k = 0;
-            for (unsigned int j = meshOffsets[mesh_idx]; j < meshOffsets[mesh_idx + 1]; ++j, ++k) {
-                ainode->mMeshes[k] = j;
-            }
+        if (!node.gpuInstance.enabled) {
+            AttachNodeMeshes(*ainode, *mScene, meshOffsets, mVertexRemappingTables, node);
         }
 
         if (node.camera) {
@@ -1699,7 +1765,6 @@ void glTF2Importer::ImportEmbeddedTextures(glTF2::Asset &r) {
     mScene->mTextures = new aiTexture *[numEmbeddedTexs];
     std::fill(mScene->mTextures, mScene->mTextures + numEmbeddedTexs, nullptr);
 
-    // Add the embedded textures
     for (size_t i = 0; i < r.images.Size(); ++i) {
         Image &img = r.images[i];
         if (!img.HasData()) {
@@ -1728,7 +1793,7 @@ void glTF2Importer::ImportEmbeddedTextures(glTF2::Asset &r) {
                     ext = "kx2";
                 } else if (strcmp(ext, "basis") == 0) { // basisu
                     ext = "bu";
-                } // webp requires no transformation
+                }
 
                 size_t len = strlen(ext);
                 if (len > 3) len = 3;
