@@ -915,6 +915,14 @@ struct Mesh : public Object {
 };
 
 struct Node : public Object {
+    struct GpuInstanceData {
+        bool enabled{false};
+        Ref<Accessor> translation;
+        Ref<Accessor> rotation;
+        Ref<Accessor> scale;
+        size_t count{0};
+    };
+
     std::vector<Ref<Node>> children;
     std::vector<Ref<Mesh>> meshes;
 
@@ -929,6 +937,7 @@ struct Node : public Object {
     std::vector<Ref<Node>> skeletons; //!< The ID of skeleton nodes. Each of which is the root of a node hierarchy.
     Ref<Skin> skin; //!< The ID of the skin referenced by this node.
     std::string jointName; //!< Name used when this node is a joint in a skin.
+    GpuInstanceData gpuInstance;
 
     Ref<Node> parent; //!< This is not part of the glTF specification. Used as a helper.
 
@@ -1138,6 +1147,7 @@ public:
         bool FB_ngon_encoding{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_mesh_gpu_instancing{false};
 
         Extensions() = default;
         ~Extensions() = default;
@@ -1148,6 +1158,7 @@ public:
         bool KHR_draco_mesh_compression{false};
         bool KHR_texture_basisu{false};
         bool EXT_texture_webp{false};
+        bool EXT_mesh_gpu_instancing{false};
 
         RequiredExtensions() = default;
     } extensionsRequired;
